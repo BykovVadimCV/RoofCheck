@@ -41,6 +41,7 @@ POLY_ROLES = {
     "exclude": "Исключить из расчёта (своя кровля снимающего, посторонние предметы)",
     "overlay": "Наложения на кадре (метка времени, значок GPS)",
     "other_roof": "Другие кровли в кадре (для синтетики: на них тоже рисуется снег)",
+    "structure": "Трубы, вентшахты, слуховые окна, антенны, тарелки на скате (не несут снег на скате, на верх ложится шапка)",
 }
 
 
@@ -60,6 +61,7 @@ class Reference:
     height: int
     polygons: list[Polygon] = field(default_factory=list)
     season: str = "autumn"          # autumn | winter: winter references are added at first snow
+    geometry: dict = field(default_factory=dict)   # per-roof prior for synthesis: length_m, depth_m, pitch_deg
     source: str = ""                # where the markup came from (customer polygon, manual, ...)
     notes: str = ""
 

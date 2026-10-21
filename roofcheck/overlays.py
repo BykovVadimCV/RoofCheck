@@ -124,3 +124,15 @@ def read_timestamp(img_bgr: np.ndarray, info: OverlayInfo | None = None) -> tupl
             except ValueError:
                 pass
     return None, text
+
+
+BLANK_VALUE = 114          # same constant for real and synthetic network inputs
+
+
+def blank(img_bgr: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    """Network input: overlay pixels set to a constant, so the burned-in date and pin carry no signal
+    (an October date next to synthetic snow would otherwise be a free shortcut)."""
+    m = detect(img_bgr).mask if mask is None else mask
+    out = img_bgr.copy()
+    out[m > 0] = BLANK_VALUE
+    return out
