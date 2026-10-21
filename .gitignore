@@ -1,0 +1,17 @@
+# data stays on disk, not in git: client photos, synthetic batches, model weights
+data/raw/
+data/objects/**/*.jpg
+data/objects/**/*.png
+data/objects/**/photos/
+data/textures/
+data/frozen_test.json
+out/
+models/
+*.pt
+*.pth
+*.onnx
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+.venv/

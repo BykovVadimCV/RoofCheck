@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Контроль уборки снега — проектное решение</title>
+<style>
+  @page {
+    size: A4;
+    margin: 21mm 20mm 20mm 20mm;
+    @bottom-left { content: "Интел-Сет · проектное решение"; font-family: "DejaVu Sans"; font-size: 7.5pt; color: #8f95bd; }
+    @bottom-right { content: counter(page); font-family: "DejaVu Sans"; font-size: 7.5pt; color: #8f95bd; }
+  }
+  @page cover { margin: 0; @bottom-left { content: none; } @bottom-right { content: none; } }
+
+  html { font-family: "DejaVu Sans", sans-serif; font-size: 8.6pt; color: #0b0b32; line-height: 1.6; }
+  body { margin: 0; }
+
+  .cover { page: cover; background: #05051a; height: 297mm; width: 210mm; position: relative; color: #f4f3ee; }
+  .cover .logo { position: absolute; top: 16mm; left: 23mm; width: 87mm; }
+  .cover .block { position: absolute; top: 84mm; left: 23mm; width: 112mm; }
+  .cover h1 { font-family: "Lora", serif; font-weight: 400; font-size: 31pt; line-height: 1.15; margin: 0 0 9mm 0; color: #f4f3ee; }
+  .cover .sub { font-size: 10.5pt; line-height: 1.55; color: #bfc5e0; margin: 0 0 21mm 0; }
+  .cover .rule { border-top: 0.8px solid #2e345f; width: 100mm; margin-bottom: 7mm; }
+  .cover .meta { font-family: "DejaVu Sans Mono", monospace; font-size: 7.6pt; color: #8f95bd; line-height: 2.25; }
+  .cover .arrow { color: #e2603a; }
+
+  section { break-before: page; }
+  h2 { font-family: "Lora", serif; font-weight: 400; font-size: 18pt; margin: 0 0 4mm 0; color: #0b0b32; }
+  .lead { font-family: "Lora", serif; font-size: 10pt; color: #5b5f7a; line-height: 1.6; margin: 0 0 6mm 0; max-width: 128mm; }
+  h3 { font-family: "Lora", serif; font-weight: 600; font-size: 10.2pt; margin: 7mm 0 2.5mm 0; color: #0b0b32; }
+  p { margin: 0 0 2.6mm 0; }
+  b { font-weight: bold; }
+  .note { font-family: "DejaVu Sans Mono", monospace; font-size: 6.7pt; color: #5b5f7a; margin: -1mm 0 4mm 0; line-height: 1.5; }
+  .small { font-size: 7.4pt; color: #5b5f7a; }
+  sup.r { font-size: 6pt; color: #6b7bc4; vertical-align: super; line-height: 0; }
+
+  table { width: 100%; border-collapse: collapse; margin: 1mm 0 4mm 0; }
+  th { font-weight: bold; font-size: 6.7pt; letter-spacing: 0.09em; text-transform: uppercase; text-align: left;
+       padding: 0 6px 2.2mm 0; border-bottom: 1.1px solid #0b0b32; vertical-align: bottom; }
+  td { font-size: 7.9pt; padding: 2.1mm 6px 2.1mm 0; border-bottom: 0.6px solid #c4cae7; vertical-align: top; line-height: 1.45; }
+  td.n, th.n { padding-right: 4mm; text-align: right; font-family: "DejaVu Sans Mono", monospace; white-space: nowrap; }
+  th.n { font-family: "DejaVu Sans", sans-serif; }
+  td.k { white-space: nowrap; }
+  td.mono { font-family: "DejaVu Sans Mono", monospace; font-size: 7.4pt; }
+
+  ul { margin: 0 0 3mm 0; padding-left: 4.5mm; }
+  li { margin: 0 0 1.4mm 0; }
+
+  .stats { display: flex; border-top: 0.9px solid #5b5f7a; margin-top: 6mm; padding-top: 3.5mm; }
+  .stat { flex: 1; padding-right: 4mm; }
+  .stat .v { font-family: "DejaVu Sans Mono", monospace; font-size: 17pt; color: #1f8a72; line-height: 1.2; }
+  .stat .c { font-size: 7pt; color: #5b5f7a; line-height: 1.4; margin-top: 1.5mm; }
+
+  .quote { border-left: 2px solid #6b7bc4; padding: 0.5mm 0 0.5mm 5mm; margin: 6mm 0; font-family: "Lora", serif; font-size: 10pt; line-height: 1.55; color: #0b0b32; max-width: 135mm; }
+
+  figure { margin: 3mm 0 5mm 0; }
+  figure img { width: 100%; display: block; }
+  figcaption { font-size: 7pt; color: #5b5f7a; margin-top: 2mm; line-height: 1.5; }
+  .cols3 { display: flex; font-family: "DejaVu Sans Mono", monospace; font-size: 6.6pt; color: #5b5f7a; margin-bottom: 1.5mm; }
+  .cols3 div { flex: 1; }
+
+  ol.src { padding-left: 5mm; font-size: 7.3pt; color: #33365a; line-height: 1.5; }
+  ol.src li { margin-bottom: 1.6mm; }
+  .mono { font-family: "DejaVu Sans Mono", monospace; }
+  .end { border-top: 0.8px solid #c4cae7; margin-top: 8mm; padding-top: 3mm; font-family: "DejaVu Sans Mono", monospace; font-size: 6.8pt; color: #5b5f7a; line-height: 1.9; }
+  .keep { break-inside: avoid; }
+  .q td { padding-top: 1.5mm; padding-bottom: 1.5mm; }
+  .q h3 { margin-top: 5mm; }
+  .q .end { margin-top: 5mm; }
+  .flow { font-family: "DejaVu Sans Mono", monospace; font-size: 7.3pt; color: #0b0b32; line-height: 2.1;
+          border-top: 0.9px solid #5b5f7a; border-bottom: 0.6px solid #c4cae7; padding: 2.5mm 0; margin: 2mm 0 5mm 0; }
+  .flow .a { color: #e2603a; padding: 0 1.6mm; }
+  .flow .p { color: #5b5f7a; }
+  pre.code { font-family: "DejaVu Sans Mono", monospace; font-size: 6.9pt; line-height: 1.5; color: #0b0b32;
+             background: #f3f4fa; border-left: 2px solid #6b7bc4; padding: 3mm 4mm; margin: 1mm 0 4mm 0; white-space: pre-wrap; }
+  pre.code .c { color: #8f95bd; }
+</style>
+</head>
+<body>

@@ -1,0 +1,5 @@
+torch>=2.3
+kornia>=0.8
+opencv-python-headless>=4.9
+numpy
+rapidocr-onnxruntime>=1.3

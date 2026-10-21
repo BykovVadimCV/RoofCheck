@@ -1,0 +1,46 @@
+{
+ "dusting_in_use": {
+  "cov_ge_1mm": 0.9670248031616211,
+  "cov_ge_2mm": 0.7999964356422424,
+  "cov_ge_5mm": 0.07512377947568893,
+  "cov_ge_20mm": 0.0,
+  "cov_ge_60mm": 0.0,
+  "melt_mm": 0.13,
+  "target": 0.8,
+  "mean_depth_cm": 0.33,
+  "p95_depth_cm": 0.53
+ },
+ "fresh_25mm_in_use": {
+  "cov_ge_1mm": 1.0,
+  "cov_ge_2mm": 0.9999995231628418,
+  "cov_ge_5mm": 0.9999856352806091,
+  "cov_ge_20mm": 0.7380142211914062,
+  "cov_ge_60mm": 7.207268208730966e-05,
+  "melt_mm": 0.0,
+  "target": null,
+  "mean_depth_cm": 2.37,
+  "p95_depth_cm": 3.71
+ },
+ "plowed_with_film": {
+  "cov_ge_1mm": 0.25297001004219055,
+  "cov_ge_2mm": 0.25000035762786865,
+  "cov_ge_5mm": 0.24277883768081665,
+  "cov_ge_20mm": 0.22339531779289246,
+  "cov_ge_60mm": 0.13712795078754425,
+  "melt_mm": 7.87,
+  "target": 0.25,
+  "mean_depth_cm": 2.71,
+  "p95_depth_cm": 15.35
+ },
+ "half_plowed": {
+  "cov_ge_1mm": 0.46999868750572205,
+  "cov_ge_2mm": 0.45000678300857544,
+  "cov_ge_5mm": 0.4272671043872833,
+  "cov_ge_20mm": 0.40485385060310364,
+  "cov_ge_60mm": 0.3719561994075775,
+  "melt_mm": 4.48,
+  "target": 0.45,
+  "mean_depth_cm": 5.16,
+  "p95_depth_cm": 10.95
+ }
+}
