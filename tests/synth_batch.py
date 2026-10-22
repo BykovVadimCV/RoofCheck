@@ -10,6 +10,8 @@ camera parameters and MoGe-2 normals (snow on every upward-facing surface) once 
   <id>_roi.png           visible target slope
   <id>_t{T}.png          binary label at threshold T mm (0/1, 255 = ignore band / overlays)
   <id>.json              parameters
+Plus N_NEG (2nd argument, default 2) real photos per background through the same pipeline without snow,
+labelled clean ("autumn_clean"), so the season of the background is not a cue.
 """
 import csv, json, sys, time
 from pathlib import Path
@@ -82,7 +84,28 @@ for bg_name, im, path, P in bgs:
                      "ground_mm": round(s.info["ground_mm"], 0), "mean_depth_mm": s.info["mean_depth_mm"],
                      "p95_depth_mm": s.info["p95_depth_mm"], "mass_ratio": s.info["mass_ratio"],
                      "eave_face_px": s.info["eave_face_px"], "cap_px": s.info["cap_px"],
-                     "world_snow_frac": s.info["neighbour_snow_frac"], "haze_beta": s.info["haze_beta_per_m"], "sec": meta["sec"]})
+                     "world_snow_frac": s.info["neighbour_snow_frac"], "sec": meta["sec"]})
+# real autumn photos as clean negatives: the same pipeline with no snow, so leafy trees and October light
+# also come with the answer "clean" and stop being a cue for "synthetic"
+N_NEG = int(sys.argv[2]) if len(sys.argv) > 2 else 2
+for bg_name, im, path, P in bgs:
+    q = np.asarray(P["slope"][0])
+    host = hostmatch.estimate(im, (q[:, 0].min(), q[:, 1].min(), q[:, 0].max(), q[:, 1].max()), path=path,
+                              ignore=overlays.detect(im).mask)
+    for k in range(N_NEG):
+        s = synth.make_sample(im, q, P["roof"][0], rng, geom, host=host, structures=P["structure"],
+                             scene=scenes.get(bg_name), null=True)
+        sid = f"{bg_name}_neg{k}_autumn_clean"
+        cv2.imwrite(str(OUT / f"{sid}.jpg"), s.image, [cv2.IMWRITE_JPEG_QUALITY, 97])
+        cv2.imwrite(str(OUT / f"{sid}_net.jpg"), overlays.blank(s.image), [cv2.IMWRITE_JPEG_QUALITY, 97])
+        cv2.imwrite(str(OUT / f"{sid}_depth.png"), np.zeros(s.depth_mm.shape, np.uint16))
+        cv2.imwrite(str(OUT / f"{sid}_cls.png"), s.classes)
+        cv2.imwrite(str(OUT / f"{sid}_roi.png"), s.roi.astype(np.uint8) * 255)
+        for T in synth.THRESHOLDS_MM:
+            cv2.imwrite(str(OUT / f"{sid}_t{T}.png"), synth.labels_at(s.depth_mm, s.classes, T))
+        (OUT / f"{sid}.json").write_text(json.dumps({"id": sid, "background": bg_name, "state": "autumn_clean",
+                                                     "coverage": {str(t): 0.0 for t in synth.THRESHOLDS_MM}, **s.info},
+                                                    ensure_ascii=False, indent=1, default=float))
 with open(OUT / "index.csv", "w", newline="") as f:
     w = csv.DictWriter(f, fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
 print(len(rows), "samples;", "mean sec", round(np.mean([r["sec"] for r in rows]), 2))

@@ -8,7 +8,8 @@
    shows the test is sensitive enough to catch a trace of that size.
 2. Label checks on out/synth: overlays never labelled snow, the ROI never covers overlays, depth >= T
    matches the binary label outside the ignore band, coverage in the json matches the depth map.
-3. --real DIR: the same low-level statistics on real snow-roof crops vs synthetic snow crops (C2ST).
+3. Distance check: snow contrast and fine detail vs distance compared with the scene's own fall-off.
+4. --real DIR: the same low-level statistics on real snow-roof crops vs synthetic snow crops (C2ST).
    Without real data this step is skipped; the result is only meaningful against a real-vs-real floor.
 
     python3 tests/validate.py [--real DIR]
@@ -179,6 +180,60 @@ def real_vs_synth(real_dir: Path):
             "note": "compare with a real-vs-real split of the same data before reading anything into it"}
 
 
+def distance_check(bands=((0, 1.5), (1.5, 3), (3, 6), (6, 99))):
+    """Does synthetic snow fade and soften with distance the way the photo does? Per distance band
+    (multiples of the target roof's depth): snow contrast against the local scene, and fine detail
+    (mean |Laplacian|) of snow vs of the scene, each relative to the nearest band. Snow ratios should
+    track the scene's ratios; snow that stays bright and crisp far away is a giveaway."""
+    from roofcheck import normals
+    est = normals.NormalEstimator()
+    origs = {"ref_2025-10-09_103538": ROOT / "data/objects/demo_roof_01/vantages/v1/reference.jpg"}
+    for n in ["2025-10-07_135619", "2025-10-07_135716", "2025-10-07_140441_tilted"]:
+        origs[n] = ROOT / f"data/raw/{n}.jpg"
+    out = {}
+    for bg, path in origs.items():
+        metas = [json.loads(f.read_text()) for f in sorted((ROOT / "out/synth").glob(f"{bg}_*.json"))]
+        if not metas:
+            continue
+        o = cv2.imread(str(path))
+        g = est.analyse(o, overlays.detect(o).mask)
+        go = cv2.cvtColor(o, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        loc = cv2.blur(go, (41, 41))
+        lap_o = np.abs(cv2.Laplacian(go, cv2.CV_32F))
+        acc = {b: [] for b in bands}
+        for m in metas:
+            sid = m["id"]
+            sg = cv2.cvtColor(cv2.imread(str(ROOT / f"out/synth/{sid}.jpg")), cv2.COLOR_BGR2GRAY).astype(np.float32)
+            dep = cv2.imread(str(ROOT / f"out/synth/{sid}_depth.png"), -1) / 10.0
+            roi = cv2.imread(str(ROOT / f"out/synth/{sid}_roi.png"), 0) > 0
+            if not roi.any():
+                continue
+            r = g.depth / np.median(g.depth[roi])
+            target = cv2.dilate(roi.astype(np.uint8), np.ones((31, 31), np.uint8)) > 0       # other surfaces only
+            snow = (cv2.erode(((dep >= 20) & g.valid).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0) & ~target
+            bare = (dep == 0) & g.valid
+            lap_s = np.abs(cv2.Laplacian(sg, cv2.CV_32F))
+            for lo, hi in bands:
+                sel, bsel = snow & (r >= lo) & (r < hi), bare & (r >= lo) & (r < hi)
+                if sel.sum() > 300 and bsel.sum() > 300:
+                    # how far snow stands above the typical brightness at its distance, vs how far the
+                    # photo's own bright objects (p97) stand above it; both shrink as haze flattens the band
+                    med = np.median(go[(r >= lo) & (r < hi) & g.valid])
+                    acc[(lo, hi)].append((float(np.median(sg[sel]) - med),
+                                          float(np.percentile(go[bsel], 97) - med),
+                                          float(lap_s[sel].mean()), float(lap_o[bsel].mean())))
+        rows = {b: np.mean(v, 0) for b, v in acc.items() if v}
+        if len(rows) < 2:
+            continue
+        b0 = min(rows)
+        out[bg] = {f"x{lo}-{hi}": {"snow_contrast": round(rows[(lo, hi)][0] / rows[b0][0], 2),
+                                   "scene_contrast": round(rows[(lo, hi)][1] / rows[b0][1], 2),
+                                   "snow_detail": round(rows[(lo, hi)][2] / rows[b0][2], 2),
+                                   "scene_detail": round(rows[(lo, hi)][3] / rows[b0][3], 2)}
+                   for lo, hi in sorted(rows)}
+    return out
+
+
 def load_backgrounds():
     vdir = ROOT / "data/objects/demo_roof_01/vantages/v1"
     ref = Reference.load(vdir / "reference.json"); ref_img = cv2.imread(str(vdir / "reference.jpg"))
@@ -197,11 +252,16 @@ def load_backgrounds():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--real", type=Path)
+    ap.add_argument("--only", choices=["distance"])
     a = ap.parse_args()
+    if a.only == "distance":
+        print(json.dumps(distance_check(), indent=1))
+        raise SystemExit
     ref, bgs = load_backgrounds()
     geom = synth.roof_geometry(ref.object_id, getattr(ref, "geometry", None))
     report = {"null_paste": null_paste(bgs, geom), "positive_control": null_paste(bgs, geom, reps=2, control=True),
               "labels": label_checks()}
+    report["distance"] = distance_check()
     if a.real:
         report["real_vs_synth"] = real_vs_synth(a.real)
     print(json.dumps(report, indent=1, ensure_ascii=False))

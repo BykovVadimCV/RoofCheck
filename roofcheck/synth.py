@@ -101,6 +101,8 @@ def fbm(shape, scale_px, octaves, rng, aniso=(1.0, 1.0)):
         out += amp * v
         tot += amp
         amp *= 0.55
+    if tot == 0:                                       # scale below a pixel: plain white noise
+        out, tot = rng.standard_normal(shape).astype(np.float32), 1.0
     out /= tot
     return (out - out.mean()) / (out.std() + 1e-6)
 
@@ -422,30 +424,69 @@ def photo_field_D(shape, mask, base_mm, rng, scale_px=80):
     return (np.clip(D, 0, None) * soft_mask(m, 1.2)).astype(np.float32)
 
 
-def haze_map(img, depth, valid, host: hostmatch.HostParams, d_ref: float) -> np.ndarray:
-    """Transmission for every pixel from the depth map: t(d) = t_roof * exp(-b (d - d_roof)). b is fitted
-    on the photo itself (dark channel at the dark end of each depth bin), so distant snow fades into
-    the same haze as the distant buildings."""
-    f = img.astype(np.float32)
-    dark = cv2.erode(f.min(axis=2), np.ones((15, 15), np.uint8))
-    A = max(float(np.max(host.airlight)), 1.0)
-    ok = valid & (depth > 0)
-    if ok.sum() < 1000 or d_ref <= 0:
-        return np.full(depth.shape, host.transmission, np.float32), 0.0
-    edges = np.quantile(depth[ok], np.linspace(0.05, 0.98, 12))
-    xs, ys = [], []
+def aerial_profile(img, depth, valid, d_ref: float, n_bins: int = 14) -> dict:
+    """How this photo itself loses contrast with distance, measured rather than modelled: per distance bin
+    (r = depth / target depth) the luminance range (p95 - p5) and the mean colour of the scene. Snow at
+    distance r is then drawn as  C = V(r) + c(r) (C_near - V(1)),  so it fades exactly as much as the
+    buildings around it. A one-parameter fog fit was too fragile on flat overcast scenes."""
+    H, W = depth.shape
+    ok = valid & (depth > 0) & np.isfinite(depth)
+    one = {"c": np.ones((H, W), np.float32), "V": None, "V1": None, "r": np.ones((H, W), np.float32), "curve": []}
+    if ok.sum() < 5000 or d_ref <= 0:
+        return one
+    r = np.where(ok, depth / d_ref, 1.0).astype(np.float32)
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    lr = np.log(r[ok])
+    edges = np.quantile(lr, np.linspace(0, 1, n_bins + 1))
+    xs, rng_, cols = [], [], []
     for a, b in zip(edges[:-1], edges[1:]):
-        sel = ok & (depth >= a) & (depth < b)
-        if sel.sum() > 300:
-            t = 1 - 0.95 * np.percentile(dark[sel], 5) / A
-            if t > 0.05:
-                xs.append((a + b) / 2)
-                ys.append(np.log(t))
-    beta = 0.0
-    if len(xs) >= 4:
-        beta = max(0.0, -np.polyfit(xs, ys, 1)[0])
-    t = host.transmission * np.exp(-beta * (depth - d_ref))
-    return np.clip(t, 0.25, 1.0).astype(np.float32), float(beta)
+        sel = ok & (np.log(r) >= a) & (np.log(r) < b)
+        if sel.sum() < 800:
+            continue
+        xs.append((a + b) / 2)
+        rng_.append(np.percentile(g[sel], 95) - np.percentile(g[sel], 5))
+        cols.append(np.median(img[sel].reshape(-1, 3), axis=0))
+    if len(xs) < 4:
+        return one
+    xs, rng_, cols = np.array(xs), np.array(rng_), np.array(cols, np.float32)
+    ref = np.interp(0.0, xs, rng_)
+    c = np.clip(rng_ / max(ref, 1e-3), 0.12, 1.0)
+    c[xs <= 0] = 1.0                                         # nearer than the target: no boost
+    c = np.minimum.accumulate(c)                             # contrast only falls with distance
+    lrp = np.log(np.clip(r, 1e-3, None))
+    cmap = np.interp(lrp, xs, c).astype(np.float32)
+    # veil: brightness of the scene at that distance, colour of the air (sky), not of the facades there
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    sky = (~valid) & (hsv[..., 1] < 40)
+    air = np.median(img[sky].reshape(-1, 3), 0).astype(np.float32) if sky.sum() > 500 else np.full(3, 200, np.float32)
+    air /= air.mean()
+    lum = cols.mean(1)
+    Vl = np.interp(lrp, xs, lum).astype(np.float32)
+    V = Vl[..., None] * air[None, None, :]
+    V1 = float(np.interp(0.0, xs, lum)) * air
+    return {"c": cmap, "V": V, "V1": V1, "r": r,
+            "curve": [[round(float(np.exp(x)), 2), round(float(cc), 3)] for x, cc in zip(xs, c)]}
+
+
+def metric_texture(r: np.ndarray, rng, px_per_m_near: float) -> np.ndarray:
+    """Snow surface texture tied to metres, not pixels: at distance r (x the target's depth) a metre covers
+    px_per_m_near / r pixels, so grain and drift-scale variation shrink with distance, and their amplitude
+    falls as more of the surface averages into each pixel. Built at four scales and blended by log2(r)."""
+    H, W = r.shape
+    lv = np.clip(np.log2(np.clip(r, 1, None)), 0, 3)
+    out = np.zeros((H, W), np.float32)
+    wsum = np.zeros((H, W), np.float32)
+    for k, rk in enumerate((1, 2, 4, 8)):
+        w = np.clip(1 - np.abs(lv - k), 0, 1).astype(np.float32)
+        if not w.any():
+            continue
+        ppm = px_per_m_near / rk
+        grain = fbm((H, W), max(0.17 * ppm, 1.5), 3, rng)                       # ~17 cm crust / footprints
+        tile = exemplar((H, W), rng, max(rng.uniform(4, 8) * ppm, 16))          # 4-8 m scans of real snow
+        amp = rk ** -0.7
+        out += w * amp * (0.03 * grain + 0.025 * tile)
+        wsum += w
+    return (1 + out / np.maximum(wsum, 1e-6)).astype(np.float32)
 
 
 def snap_to_segments(img, prob, valid, n_segments=4000):
@@ -465,13 +506,14 @@ def snap_to_segments(img, prob, valid, n_segments=4000):
     return keep[seg], p_mean[seg].astype(np.float32)
 
 
-def world_snow(scene: "normals.Geometry", img, exclude, weather, state, rng):
+def world_snow(scene: "normals.Geometry", img, exclude, weather, state, rng, r=None, ppm_near: float = 35.0):
     """Snow on every upward-facing surface outside the target slope (roofs across the city, cornices,
     sills, chimney tops, the ground), from the same snowfall: depth = ground snow x mu(tilt). Each
     connected surface gets its own clearing: most are left alone, some are cleared or half-cleared;
     in a thaw the whole town melts patchily, not just the target roof."""
     H, W = img.shape[:2]
-    up = (scene.mu > 0.3) & scene.valid & ~normals.vegetation(img)
+    veg = normals.vegetation(img, scene.normal)
+    up = (scene.mu > 0.3) & scene.valid & ~veg
     m, mu_seg = snap_to_segments(img, up.astype(np.float32), scene.valid)
     m = cv2.GaussianBlur(m.astype(np.float32), (0, 0), 1.5) > 0.5          # no superpixel staircase
     # thin upward ledges (sills, cornices, balcony rails) are lost in superpixels: add them per pixel
@@ -479,8 +521,15 @@ def world_snow(scene: "normals.Geometry", img, exclude, weather, state, rng):
     ledge = upm & ~ndi.binary_opening(upm, np.ones((7, 7))) & (ndi.binary_opening(upm, np.ones((1, 9))))
     m |= ledge
     mu_seg = np.where(ledge, scene.mu, mu_seg)
-    m &= ~exclude & ~normals.vegetation(img)
+    m &= ~exclude & ~veg
     m = ndi.binary_opening(m, np.ones((2, 2)))
+    r = np.ones((H, W), np.float32) if r is None else np.clip(r, 0.3, 50)
+    ppm = (ppm_near / r).astype(np.float32)                 # photo px per metre at each pixel
+    # ragged outline at metre scale: ~0.25 m wobble, i.e. several px near, sub-pixel far away
+    amp = np.clip(0.25 * ppm, 0.3, 5.0)
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    dx, dy = fbm((H, W), 18, 3, rng) * amp, fbm((H, W), 18, 3, rng) * amp
+    m = (cv2.remap(m.astype(np.float32), xx + dx, yy + dy, cv2.INTER_LINEAR) > 0.5) & ~exclude
     lbl, n = ndi.label(m)
     base = weather["ground_mm"] * rng.uniform(0.7, 1.0)
     full = base * (1 + 0.2 * fbm((H, W), 80, 3, rng))
@@ -497,8 +546,26 @@ def world_snow(scene: "normals.Geometry", img, exclude, weather, state, rng):
     D = np.where(sel == 0, full, np.where(sel == 1, cleared, patchy)) * np.clip(mu_seg, 0, 1)
     if state == "thaw":
         D *= rng.uniform(0.3, 0.7)
-    D = np.clip(D, 0, None) * soft_mask(m, 0.8)
+    # wind scour: the layer thins over the last 0.15-0.5 m before a free roof edge
+    edge_m = ndi.distance_transform_edt(m) / ppm
+    taper_m = rng.uniform(0.15, 0.5)
+    D *= np.clip(edge_m / taper_m, 0, 1) ** 0.7
+    # drifts against walls and parapets rising above a surface (the photo's 'above' = wall pixels just over
+    # the snow edge): triangular, length 0.8-2.5 m, peak 0.4-1.2 x the base depth (SP 20: length 2h)
+    wall = scene.valid & (np.nan_to_num(scene.tilt_deg, nan=0) > 70) & ~m
+    seed = m & np.roll(ndi.binary_dilation(wall, np.ones((3, 1))), 2, axis=0)
+    n_drift = 0
+    if seed.sum() > 20 and state != "thaw":
+        d_m = ndi.distance_transform_edt(~seed) / ppm
+        L = rng.uniform(0.8, 2.5)
+        drift = np.clip(1 - d_m / L, 0, 1) * base * rng.uniform(0.4, 1.2)
+        keep = sel != 1                                      # not on surfaces that were cleared
+        D = D + drift * m * keep * np.clip(mu_seg, 0, 1)
+        n_drift = int(seed.sum())
+    ramp = np.clip(0.06 * ppm, 0.6, 2.0)                    # ~6 cm soft edge
+    D = np.clip(D, 0, None) * np.clip(0.5 + (ndi.distance_transform_edt(m) - 0.5) / (2 * ramp), 0, 1)
     return D.astype(np.float32), m, {"world_base_mm": round(float(base), 1), "world_surfaces": int(n),
+                                     "world_drift_seed_px": n_drift, "world_taper_m": round(float(taper_m), 2),
                                      "world_cleared": int((st[1:] == 1).sum()), "world_patchy": int((st[1:] == 2).sum())}
 
 
@@ -518,16 +585,42 @@ def neighbour_from_polygons(img, polys, metal_lab):
     return k & (m > 0)
 
 
-def winter_grade(img_f, rng):
-    """Autumn foliage toward winter: desaturate and darken green / yellow / orange vegetation."""
-    hsv = cv2.cvtColor(np.clip(img_f, 0, 255).astype(np.uint8), cv2.COLOR_BGR2HSV).astype(np.float32)
-    veg = (hsv[..., 0] > 12) & (hsv[..., 0] < 95) & (hsv[..., 1] > 70)
-    veg = cv2.GaussianBlur(veg.astype(np.float32), (0, 0), 2)
-    k = rng.uniform(0.5, 0.85)
-    hsv[..., 1] *= 1 - k * veg
-    hsv[..., 2] *= 1 - rng.uniform(0.1, 0.3) * veg
-    out = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
-    return out
+def winter_grade(img_f, rng, veg: np.ndarray, sky_rgb, snow_mm: float = 0.0):
+    """Deciduous crowns toward bare winter trees: leaves gone means the crown is a grey-brown tangle of
+    twigs with the background showing through. Colour drained, crown thinned toward the veil colour in
+    leaf-sized holes, twigs darkened; after a heavy fall, some snow on the upper sides of branches.
+    The mask comes from colour + texture (normals.vegetation), so yellow facades are left alone."""
+    out = img_f.copy()
+    if not veg.any():
+        return out, 0.0
+    H, W = veg.shape
+    veg = cv2.morphologyEx(veg.astype(np.uint8), cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))) > 0
+    veg = ndi.binary_fill_holes(veg)                                        # whole crowns, no leafy islands
+    w = cv2.GaussianBlur(veg.astype(np.float32), (0, 0), 2.0)
+    lum = out.mean(2)
+    loc = cv2.GaussianBlur(lum, (0, 0), 6)
+    detail = lum - loc                                                       # branch structure, kept
+    bark = np.array([0.95, 0.99, 1.04], np.float32)[None, None, :]          # BGR: grey with a brown cast
+    grey = (loc * rng.uniform(0.72, 0.85))[..., None] * bark + 0.8 * detail[..., None]
+    gaps = np.clip(0.5 + 0.6 * fbm((H, W), rng.uniform(8, 14), 3, rng), 0, 1)
+    gaps = cv2.GaussianBlur(gaps, (0, 0), 1.0)[..., None]                   # leaf-cluster sized openings
+    veil = np.full((1, 1, 3), float(np.mean(sky_rgb)) * rng.uniform(0.85, 0.97), np.float32)   # neutral
+    crown = grey * (1 - 0.3 * gaps) + veil * 0.3 * gaps
+    if snow_mm > 80:                                                        # snow along the crowns' tops
+        top = veg & (np.roll(veg, 3, axis=0) == 0)
+        top = cv2.GaussianBlur(ndi.binary_dilation(top, np.ones((2, 3))).astype(np.float32), (0, 0), 0.8)
+        crown = crown * (1 - 0.7 * top[..., None]) + veil * 1.08 * 0.7 * top[..., None]
+    k = rng.uniform(0.85, 1.0)
+    out = out * (1 - k * w[..., None]) + crown * (k * w[..., None])
+    return out, float(veg.mean())
+
+
+def white_balance(img_f, snow_frac, rng):
+    """A camera's auto white balance and exposure react to a frame full of snow: slightly cooler, a bit
+    darker. Shift grows with the share of snow in the frame."""
+    s = min(1.0, snow_frac / 0.25) * rng.uniform(0.0, 1.0)
+    g = np.array([1 + 0.035 * s, 1.0, 1 - 0.025 * s], np.float32)            # BGR: blue up, red down
+    return img_f * g[None, None, :], round(float(s), 3)
 
 
 # ------------------------------------------------------------------ photo-space volume
@@ -674,14 +767,14 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     # ---- neighbouring roofs and the photographer's own roof: same weather, own clearing
     neigh = np.zeros((H0, W0), bool)
     Dn = np.zeros((H0, W0), np.float32)
-    tmap, haze_beta, w_info = None, 0.0, {}
+    aer, w_info = None, {}
     if scene is not None:
         excl = on_slope | (struct_ph > 0) | face | (ov.mask > 0) | below_eave & _near_quad(geo.quad, (H0, W0), 0.05)
         neigh = np.zeros((H0, W0), bool)
-        if not null:
-            Dn, neigh, w_info = world_snow(scene, img, excl, weather, state, rng)
         d_ref = float(np.median(scene.depth[on_slope])) if on_slope.any() else 0.0
-        tmap, haze_beta = haze_map(img, scene.depth, scene.valid, host, d_ref)
+        aer = aerial_profile(img, scene.depth, scene.valid, d_ref)
+        if not null:
+            Dn, neigh, w_info = world_snow(scene, img, excl, weather, state, rng, r=aer["r"], ppm_near=geo.px_per_m_photo)
     elif other_roofs:
         neigh = neighbour_from_polygons(img, other_roofs, layers["metal_lab"]) & (ov.mask == 0) & ~on_slope
         if neigh.any() and not null:
@@ -693,10 +786,13 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     frac = float((A * on_slope).mean() + opacity(Dn, beta).mean())
     e = 1 - min(0.15, 1.5 * frac) if frac > 0.02 and not null else 1.0
     bg = img_f * e
-    graded = False
-    if not null and weather["ground_mm"] > 30 and rng.random() < 0.7:
-        bg = winter_grade(bg, rng)
-        graded = True
+    graded = 0.0
+    if not null and weather["ground_mm"] > 10:
+        hsv0 = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        skyp = (scene is not None and (~scene.valid)) if scene is not None else (hsv0[..., 1] < 30) & (img.mean(2) > np.percentile(img.mean(2), 95))
+        sky_rgb = np.median(img[skyp].reshape(-1, 3), 0) if np.sum(skyp) > 500 else np.array(host.airlight)
+        veg = normals.vegetation(img, scene.normal if scene is not None else None) & ~on_slope & (ov.mask == 0)
+        bg, graded = winter_grade(bg, rng, veg, sky_rgb, weather["ground_mm"])
     bg = bg * Wd[..., None]
 
     snow_hz = hostmatch.apply_haze(snow[None, None, :], host)                    # (1,1,3)
@@ -708,10 +804,15 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
         cos_t = cv2.GaussianBlur(np.cos(np.radians(np.nan_to_num(scene.tilt_deg, nan=90.0))).astype(np.float32), (0, 0), 4)
         g0 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
         under = np.clip(cv2.GaussianBlur(g0, (0, 0), 2.5) / (cv2.GaussianBlur(g0, (0, 0), 20) + 1), 0.8, 1.1)
-        ex = exemplar((H0, W0), rng, rng.uniform(150, 300))
-        sky = (0.62 + 0.38 * cos_t) * tex_p * (1 + 0.6 * (under - 1)) * (1 + 0.025 * ex)   # shadows and edges stay
-        t = tmap[..., None]
-        col_w = (snow[None, None, :] * t + np.array(host.airlight, np.float32) * (1 - t)) * sky[..., None]
+        r = aer["r"]
+        tex_m = metric_texture(r, rng, geo.px_per_m_photo)
+        sky = (0.62 + 0.38 * cos_t) * tex_m * (1 + 0.6 * (under - 1))           # shadows and edges stay
+        col_near = snow_hz * sky[..., None]
+        col_w = col_near if aer["V"] is None else aer["V"] + aer["c"][..., None] * (col_near - aer["V1"])
+        # distant surfaces are already softer in the photo (lens, haze, resampling): soften snow likewise
+        wb = np.clip(np.log2(np.clip(r, 1, None)) / 3, 0, 1)[..., None]
+        col_w = col_w * (1 - wb) + cv2.GaussianBlur(col_w, (0, 0), 1.2) * wb
+        a_n = a_n * (1 - wb[..., 0]) + cv2.GaussianBlur(a_n, (0, 0), 1.0) * wb[..., 0]
         col = np.where((a_n > alpha)[..., None], col_w, col)
     alpha = np.maximum(alpha, a_n)
     face_a = face.astype(np.float32) * (0.75 + 0.1 * fbm((H0, W0), 4, 2, rng))
@@ -725,6 +826,9 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     pm, ab = hostmatch.blur_layer(col * alpha[..., None], alpha.astype(np.float32), host)
     out = bg * (1 - ab[..., None]) + pm
     weight = cv2.GaussianBlur((ab > 0.02).astype(np.float32), (0, 0), 2.0)
+    wb = 0.0
+    if not null:
+        out, wb = white_balance(out, float((ab > 0.5).mean()), rng)
     out = hostmatch.finish(out, weight, host, rng)
     out[ov.mask > 0] = img_f[ov.mask > 0]                         # the app stamps after processing
     ok, enc = cv2.imencode(".jpg", out.astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, int(host.jpeg_quality)])
@@ -760,9 +864,9 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
             "visible_slope_frac": round(float(vis.mean()), 3), "cornice_px": ext,
             "eave_face_px": int(face.sum()), "cap_px": int((cap_struct | cap_rail).sum()),
             "neighbour_frac": round(float(neigh.mean()), 3), "neighbour_snow_frac": round(float((Dn >= label_tau_mm).mean()), 3),
-            **w_info, "haze_beta_per_m": round(haze_beta, 4), "scene_normals": scene is not None,
+            **w_info, "contrast_vs_distance": aer["curve"] if aer else None, "scene_normals": scene is not None,
             "up_vector": [round(float(v), 3) for v in scene.up] if scene is not None else None,
-            "winter_grade": graded, "exposure": round(e, 3), "label_tau_mm": label_tau_mm, "null": null,
+            "bare_trees_frac": round(graded, 3), "white_balance_shift": wb, "exposure": round(e, 3), "label_tau_mm": label_tau_mm, "null": null,
             "host": host.as_dict()}
     return Sample(out, depth, cls, roi, cov, info)
 

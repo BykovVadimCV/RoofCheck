@@ -112,8 +112,28 @@ def pitch_of(geo: Geometry, mask: np.ndarray) -> float | None:
     return float(np.nanmedian(t)) if t.size > 200 else None
 
 
-def vegetation(img_bgr: np.ndarray) -> np.ndarray:
+def roughness(normal: np.ndarray, k: int = 15) -> np.ndarray:
+    """1 - |local mean normal|: ~0 on planar surfaces (facades, roofs), large in tree crowns."""
+    m = np.stack([cv2.blur(normal[..., i], (k, k)) for i in range(3)], -1)
+    return (1 - np.linalg.norm(m, axis=2)).astype(np.float32)
+
+
+def vegetation(img_bgr: np.ndarray, normal: np.ndarray | None = None) -> np.ndarray:
+    """Foliage: leaf colour (green, or strongly saturated autumn yellow/orange/red), leafy texture, and,
+    when normals are given, a chaotic surface orientation. Colour + texture alone takes window frames and
+    ochre plaster; planar facades have smooth normals, crowns do not."""
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    v = (hsv[..., 0] > 12) & (hsv[..., 0] < 95) & (hsv[..., 1] > 70)
-    v = cv2.morphologyEx(v.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    return cv2.dilate(v, np.ones((5, 5), np.uint8)) > 0
+    h, sat, val = hsv[..., 0].astype(np.int16), hsv[..., 1], hsv[..., 2]
+    green = (h >= 30) & (h < 95) & (sat > 40)
+    autumn = ((h < 30) | (h > 165)) & (sat > 80)
+    colour = (green | autumn) & (val > 25)
+    g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    mu = cv2.blur(g, (9, 9))
+    sd = np.sqrt(np.clip(cv2.blur(g * g, (9, 9)) - mu * mu, 0, None))
+    v = colour & (sd > 8)
+    if normal is not None:
+        v &= cv2.blur(roughness(normal).astype(np.float32), (9, 9)) > 0.02
+    v = cv2.morphologyEx(v.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(v)
+    v = np.isin(lab, 1 + np.flatnonzero(st[1:, cv2.CC_STAT_AREA] >= 600))      # crowns, not window frames
+    return cv2.dilate(v.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0

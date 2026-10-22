@@ -58,7 +58,22 @@ with structures outlined once per vantage (`structure` role) since grey chimneys
   added per pixel; each surface cleared or left on its own; in a thaw the whole town melts. Haze by depth:
   t(d) = t_roof·exp(−b(d − d_roof)), b fitted per photo from the dark channel (0.0005–0.0036 /m).
 
+Realism round 3 (critique: no aerial perspective, one texture at all distances, cut-out edges, October scene):
+- Haze: snow at distance r (x target depth) drawn as V(r) + c(r)(C − V(1)); c(r) and V(r) measured on each photo
+  (luminance range and level per distance bin, colour of the veil from the sky). Replaces the single fog fit,
+  which gave near-zero fog on flat overcast frames. `tests/validate.py` distance check: before, snow kept full
+  contrast at 6× distance (0.73–1.18 of near) while the scene fell to 0.53–0.79; now 0.43–0.82 (noisy, 4 photos).
+- Texture in metres: grain ~17 cm and 4–8 m exemplar tiles scaled by px/m at each pixel's distance, amplitude
+  ∝ r^-0.7, extra softening with distance. Snow detail now falls to 0.42–0.75 of near at the far band.
+- Other roofs: outline wobble ~0.25 m, thinning over the last 0.15–0.5 m to a free edge, triangular drifts
+  0.8–2.5 m against walls and parapets above, ~6 cm soft edge.
+- Season: foliage mask = leaf colour + texture + rough normals (colour alone took ochre facades and window
+  frames); whole crowns greyed with branch detail kept and leaf-sized gaps; snow along crown tops after heavy
+  falls; AWB shift (cooler, scaled by snow share). Batch adds real autumn photos through the same pipeline,
+  labelled clean, so leafy trees are not a cue for "synthetic".
+
 Open:
+- Small or partly hidden crowns keep their leaves; outlines on the nearest roofs look slightly torn.
 8. Optional: diffusion winterisation of trees/ground (now: simple desaturation of foliage).
 - Snow texture at 2× zoom reads as mottled; needs comparison with real winter roofs from this distance.
 - Rust stains with strong colour still count as structures (bite out of the snow).
