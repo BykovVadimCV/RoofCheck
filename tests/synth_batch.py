@@ -2,7 +2,7 @@
 
 Backgrounds: the reference and the other autumn photos of the same point (polygons carried over by
 registration). Roof geometry is fixed per object (reference.geometry or a prior seeded by the object id);
-camera parameters are measured once per background. Per sample:
+camera parameters and MoGe-2 normals (snow on every upward-facing surface) once per background. Per sample:
   <id>.jpg               image (overlays left in place, as the app stamps them)
   <id>_net.jpg           network input: overlays blanked
   <id>_depth.png         uint16, 0.1 mm, all snow-bearing surfaces
@@ -15,7 +15,7 @@ import csv, json, sys, time
 from pathlib import Path
 import cv2, numpy as np, torch
 ROOT = Path(__file__).resolve().parents[1]; sys.path.insert(0, str(ROOT))
-from roofcheck import synth, overlays, hostmatch
+from roofcheck import synth, overlays, hostmatch, normals
 from roofcheck.register import Registrar
 from roofcheck.schema import Reference
 torch.set_num_threads(2)
@@ -26,8 +26,6 @@ for f in OUT.glob("*"):
 OBJ = "demo_roof_01"
 vdir = ROOT / f"data/objects/{OBJ}/vantages/v1"
 ref = Reference.load(vdir / "reference.json"); ref_img = cv2.imread(str(vdir / "reference.jpg"))
-geom = synth.roof_geometry(OBJ, getattr(ref, "geometry", None))
-print("geometry:", geom)
 reg = Registrar()
 bgs = [("ref_2025-10-09_103538", ref_img, vdir / "reference.jpg",
         {r: [np.array(p.points) for p in ref.by_role(r)] for r in ("roof", "slope", "other_roof", "structure")})]
@@ -37,6 +35,25 @@ for name in ["2025-10-07_135619", "2025-10-07_135716", "2025-10-07_140441_tilted
     r = reg.register(im, ref, ref_img)
     if r.ok:
         bgs.append((name, im, path, {k: r.polygons.get(k, []) for k in ("roof", "slope", "other_roof", "structure")}))
+# normals once per background (cached); roof pitch = median over the vantage's photos unless the reference has it
+est = normals.NormalEstimator() if (ROOT / "models/moge-2-vitb-normal.pt").exists() else None
+scenes, pitches = {}, []
+for bg_name, im, path, P in bgs:
+    if est is None:
+        break
+    sc = est.analyse(im, overlays.detect(im).mask)
+    scenes[bg_name] = sc
+    m = np.zeros(im.shape[:2], np.uint8)
+    cv2.fillPoly(m, [np.round(np.asarray(P["slope"][0])).astype(np.int32)], 1)
+    pt = normals.pitch_of(sc, m > 0)
+    if pt:
+        pitches.append(pt)
+stored = dict(getattr(ref, "geometry", None) or {})
+geom = synth.roof_geometry(OBJ, stored or None)
+if "pitch_deg" not in stored and pitches:
+    geom.update(pitch_deg=round(float(np.median(pitches)), 1),
+                source=geom["source"] + f"; pitch from MoGe-2 normals, median of {len(pitches)} photos")
+print("geometry:", geom, "per-photo pitch:", [round(p, 1) for p in pitches])
 rng = np.random.default_rng(2026)
 rows = []
 for bg_name, im, path, P in bgs:
@@ -48,7 +65,7 @@ for bg_name, im, path, P in bgs:
         st = synth.STATES[k % len(synth.STATES)]
         t = time.time()
         s = synth.make_sample(im, q, P["roof"][0], rng, geom, host=host, other_roofs=P["other_roof"],
-                             structures=P["structure"], state=st)
+                             structures=P["structure"], state=st, scene=scenes.get(bg_name))
         sid = f"{bg_name}_{k:03d}_{st}"
         cv2.imwrite(str(OUT / f"{sid}.jpg"), s.image, [cv2.IMWRITE_JPEG_QUALITY, 97])
         cv2.imwrite(str(OUT / f"{sid}_net.jpg"), overlays.blank(s.image), [cv2.IMWRITE_JPEG_QUALITY, 97])
@@ -64,7 +81,8 @@ for bg_name, im, path, P in bgs:
                      **{f"cov_{k_}mm": round(v, 3) for k_, v in s.coverage.items()},
                      "ground_mm": round(s.info["ground_mm"], 0), "mean_depth_mm": s.info["mean_depth_mm"],
                      "p95_depth_mm": s.info["p95_depth_mm"], "mass_ratio": s.info["mass_ratio"],
-                     "eave_face_px": s.info["eave_face_px"], "cap_px": s.info["cap_px"], "sec": meta["sec"]})
+                     "eave_face_px": s.info["eave_face_px"], "cap_px": s.info["cap_px"],
+                     "world_snow_frac": s.info["neighbour_snow_frac"], "haze_beta": s.info["haze_beta_per_m"], "sec": meta["sec"]})
 with open(OUT / "index.csv", "w", newline="") as f:
     w = csv.DictWriter(f, fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
 print(len(rows), "samples;", "mean sec", round(np.mean([r["sec"] for r in rows]), 2))

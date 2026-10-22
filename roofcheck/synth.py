@@ -33,7 +33,7 @@ import cv2
 import numpy as np
 from scipy import ndimage as ndi
 
-from . import hostmatch, overlays
+from . import hostmatch, normals, overlays
 from .schema import SEG_CLASSES
 
 CLS = {k: i for i, (k, _) in enumerate(SEG_CLASSES)}
@@ -422,6 +422,86 @@ def photo_field_D(shape, mask, base_mm, rng, scale_px=80):
     return (np.clip(D, 0, None) * soft_mask(m, 1.2)).astype(np.float32)
 
 
+def haze_map(img, depth, valid, host: hostmatch.HostParams, d_ref: float) -> np.ndarray:
+    """Transmission for every pixel from the depth map: t(d) = t_roof * exp(-b (d - d_roof)). b is fitted
+    on the photo itself (dark channel at the dark end of each depth bin), so distant snow fades into
+    the same haze as the distant buildings."""
+    f = img.astype(np.float32)
+    dark = cv2.erode(f.min(axis=2), np.ones((15, 15), np.uint8))
+    A = max(float(np.max(host.airlight)), 1.0)
+    ok = valid & (depth > 0)
+    if ok.sum() < 1000 or d_ref <= 0:
+        return np.full(depth.shape, host.transmission, np.float32), 0.0
+    edges = np.quantile(depth[ok], np.linspace(0.05, 0.98, 12))
+    xs, ys = [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        sel = ok & (depth >= a) & (depth < b)
+        if sel.sum() > 300:
+            t = 1 - 0.95 * np.percentile(dark[sel], 5) / A
+            if t > 0.05:
+                xs.append((a + b) / 2)
+                ys.append(np.log(t))
+    beta = 0.0
+    if len(xs) >= 4:
+        beta = max(0.0, -np.polyfit(xs, ys, 1)[0])
+    t = host.transmission * np.exp(-beta * (depth - d_ref))
+    return np.clip(t, 0.25, 1.0).astype(np.float32), float(beta)
+
+
+def snap_to_segments(img, prob, valid, n_segments=4000):
+    """Snow-bearing surfaces from the normals, snapped to image superpixels (SLIC) so the mask follows real
+    roof edges instead of the network's soft, over-reaching boundaries. Returns the mask and the mean
+    shape factor per segment (no pixel-level speckle from noisy normals)."""
+    from skimage.segmentation import slic
+    H, W = img.shape[:2]
+    s = 1024 / max(H, W)
+    small = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    seg = slic(small[:, :, ::-1], n_segments=n_segments, compactness=8, start_label=0, channel_axis=-1)
+    seg = cv2.resize(seg.astype(np.int32), (W, H), interpolation=cv2.INTER_NEAREST)
+    n = seg.max() + 1
+    cnt = np.bincount(seg.ravel(), minlength=n) + 1e-6
+    p_mean = np.bincount(seg.ravel(), (prob * valid).ravel(), minlength=n) / cnt
+    keep = p_mean > 0.55
+    return keep[seg], p_mean[seg].astype(np.float32)
+
+
+def world_snow(scene: "normals.Geometry", img, exclude, weather, state, rng):
+    """Snow on every upward-facing surface outside the target slope (roofs across the city, cornices,
+    sills, chimney tops, the ground), from the same snowfall: depth = ground snow x mu(tilt). Each
+    connected surface gets its own clearing: most are left alone, some are cleared or half-cleared;
+    in a thaw the whole town melts patchily, not just the target roof."""
+    H, W = img.shape[:2]
+    up = (scene.mu > 0.3) & scene.valid & ~normals.vegetation(img)
+    m, mu_seg = snap_to_segments(img, up.astype(np.float32), scene.valid)
+    m = cv2.GaussianBlur(m.astype(np.float32), (0, 0), 1.5) > 0.5          # no superpixel staircase
+    # thin upward ledges (sills, cornices, balcony rails) are lost in superpixels: add them per pixel
+    upm = (scene.mu > 0.6) & scene.valid
+    ledge = upm & ~ndi.binary_opening(upm, np.ones((7, 7))) & (ndi.binary_opening(upm, np.ones((1, 9))))
+    m |= ledge
+    mu_seg = np.where(ledge, scene.mu, mu_seg)
+    m &= ~exclude & ~normals.vegetation(img)
+    m = ndi.binary_opening(m, np.ones((2, 2)))
+    lbl, n = ndi.label(m)
+    base = weather["ground_mm"] * rng.uniform(0.7, 1.0)
+    full = base * (1 + 0.2 * fbm((H, W), 80, 3, rng))
+    cleared = residual(H, W, rng, hi=rng.uniform(0, 3)) * (rng.random() < 0.6)
+    melt_thr = rng.uniform(-0.8, 0.8)
+    patchy = np.where(fbm((H, W), 40, 3, rng) < melt_thr, full, cleared)
+    p = [0.3, 0.15, 0.55] if state == "thaw" else [0.7, 0.15, 0.15]
+    st = rng.choice(3, n + 1, p=p)
+    st[0] = 0
+    sizes = np.bincount(lbl.ravel(), minlength=n + 1)
+    if state != "thaw":
+        st[sizes < 60] = 0                              # sills and ledges: nobody clears them
+    sel = st[lbl]
+    D = np.where(sel == 0, full, np.where(sel == 1, cleared, patchy)) * np.clip(mu_seg, 0, 1)
+    if state == "thaw":
+        D *= rng.uniform(0.3, 0.7)
+    D = np.clip(D, 0, None) * soft_mask(m, 0.8)
+    return D.astype(np.float32), m, {"world_base_mm": round(float(base), 1), "world_surfaces": int(n),
+                                     "world_cleared": int((st[1:] == 1).sum()), "world_patchy": int((st[1:] == 2).sum())}
+
+
 def neighbour_from_polygons(img, polys, metal_lab):
     H, W = img.shape[:2]
     m = np.zeros((H, W), np.uint8)
@@ -516,8 +596,10 @@ class Sample:
 
 def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, geom: dict,
                 host: hostmatch.HostParams | None = None, other_roofs: list | None = None, structures: list | None = None,
-                state: str | None = None, label_tau_mm: float = 2.0, null: bool = False) -> Sample:
-    """null=True runs the whole compositing chain with zero snow (shortcut test, see tests/validate.py)."""
+                state: str | None = None, label_tau_mm: float = 2.0, null: bool = False,
+                scene: "normals.Geometry | None" = None) -> Sample:
+    """scene: normals of the frame (normals.NormalEstimator.analyse); snow then lies on every upward-facing
+    surface. Without it, only the other_roof polygons get snow. null=True runs the whole compositing chain with zero snow (shortcut test, see tests/validate.py)."""
     H0, W0 = img.shape[:2]
     ov = overlays.detect(img)
     if host is None:
@@ -592,7 +674,15 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     # ---- neighbouring roofs and the photographer's own roof: same weather, own clearing
     neigh = np.zeros((H0, W0), bool)
     Dn = np.zeros((H0, W0), np.float32)
-    if other_roofs:
+    tmap, haze_beta, w_info = None, 0.0, {}
+    if scene is not None:
+        excl = on_slope | (struct_ph > 0) | face | (ov.mask > 0) | below_eave & _near_quad(geo.quad, (H0, W0), 0.05)
+        neigh = np.zeros((H0, W0), bool)
+        if not null:
+            Dn, neigh, w_info = world_snow(scene, img, excl, weather, state, rng)
+        d_ref = float(np.median(scene.depth[on_slope])) if on_slope.any() else 0.0
+        tmap, haze_beta = haze_map(img, scene.depth, scene.valid, host, d_ref)
+    elif other_roofs:
         neigh = neighbour_from_polygons(img, other_roofs, layers["metal_lab"]) & (ov.mask == 0) & ~on_slope
         if neigh.any() and not null:
             nbase = weather["ground_mm"] * rng.uniform(0.5, 1.1) * (0.15 if rng.random() < 0.25 else 1.0)
@@ -614,6 +704,15 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     alpha = A * on_slope
     col = snow_hz * (S * tex_p)[..., None]
     a_n = opacity(Dn, beta) * neigh
+    if scene is not None and neigh.any():
+        cos_t = cv2.GaussianBlur(np.cos(np.radians(np.nan_to_num(scene.tilt_deg, nan=90.0))).astype(np.float32), (0, 0), 4)
+        g0 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        under = np.clip(cv2.GaussianBlur(g0, (0, 0), 2.5) / (cv2.GaussianBlur(g0, (0, 0), 20) + 1), 0.8, 1.1)
+        ex = exemplar((H0, W0), rng, rng.uniform(150, 300))
+        sky = (0.62 + 0.38 * cos_t) * tex_p * (1 + 0.6 * (under - 1)) * (1 + 0.025 * ex)   # shadows and edges stay
+        t = tmap[..., None]
+        col_w = (snow[None, None, :] * t + np.array(host.airlight, np.float32) * (1 - t)) * sky[..., None]
+        col = np.where((a_n > alpha)[..., None], col_w, col)
     alpha = np.maximum(alpha, a_n)
     face_a = face.astype(np.float32) * (0.75 + 0.1 * fbm((H0, W0), 4, 2, rng))
     col = np.where(face[..., None], snow_hz * (0.78 * tex_p)[..., None], col)        # vertical face, half sky
@@ -639,7 +738,7 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     depth[cap_struct | cap_rail] = np.maximum(depth[cap_struct | cap_rail], max(base_mm, label_tau_mm + 2))
     depth[struct_p & ~cap_struct] = 0
     cls = np.zeros((H0, W0), np.uint8)
-    roofish = on_slope | neigh
+    roofish = on_slope | (neigh if scene is None else np.zeros_like(neigh))
     cls[roofish] = CLS["metal_clean"]
     cls[roofish & (Wd < 0.9)] = CLS["metal_wet"]
     snowy = depth >= label_tau_mm
@@ -661,6 +760,8 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
             "visible_slope_frac": round(float(vis.mean()), 3), "cornice_px": ext,
             "eave_face_px": int(face.sum()), "cap_px": int((cap_struct | cap_rail).sum()),
             "neighbour_frac": round(float(neigh.mean()), 3), "neighbour_snow_frac": round(float((Dn >= label_tau_mm).mean()), 3),
+            **w_info, "haze_beta_per_m": round(haze_beta, 4), "scene_normals": scene is not None,
+            "up_vector": [round(float(v), 3) for v in scene.up] if scene is not None else None,
             "winter_grade": graded, "exposure": round(e, 3), "label_tau_mm": label_tau_mm, "null": null,
             "host": host.as_dict()}
     return Sample(out, depth, cls, roi, cov, info)
@@ -673,6 +774,16 @@ def labels_at(depth: np.ndarray, cls: np.ndarray, threshold_mm: float, band_mm: 
     y[np.abs(depth - threshold_mm) <= band_mm] = 255
     y[cls == CLS["ignore"]] = 255
     return y
+
+
+def _near_quad(quad, shape, margin):
+    """Pixels within margin x quad size of the target slope (the facade top right under the eave)."""
+    q = np.asarray(quad, np.float32)
+    c = q.mean(0)
+    big = c + (q - c) * (1 + 2 * margin)
+    m = np.zeros(shape, np.uint8)
+    cv2.fillPoly(m, [np.round(big).astype(np.int32)], 1)
+    return m > 0
 
 
 def _below_line(a, b, shape):

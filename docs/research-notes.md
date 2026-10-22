@@ -51,9 +51,17 @@ Done (October 2026, `synth.py` v2, `hostmatch.py`, `tests/validate.py`):
 Fixes found on the way: structure detection by darkness flagged 38% of the slope (shadows, seams); now by colour,
 with structures outlined once per vantage (`structure` role) since grey chimneys match metal in colour.
 
+- 1. Normals for the whole frame (`roofcheck/normals.py`, MoGe-2 ViT-B normal, CPU ~40 s per photo, cached).
+  Up vector fitted from facade normals (catches roll on the tilted photo). Roof pitch from normals: 26.0, 20.9,
+  24.3, 31.2 deg on the 4 photos, median 25.1 used as the object's pitch. Snow on every surface tilted < 60 deg
+  (depth = ground snow × μ(tilt)), mask snapped to SLIC superpixels so it follows real roof edges; thin ledges
+  added per pixel; each surface cleared or left on its own; in a thaw the whole town melts. Haze by depth:
+  t(d) = t_roof·exp(−b(d − d_roof)), b fitted per photo from the dark channel (0.0005–0.0036 /m).
+
 Open:
-1. Normals for the whole frame (MoGe-2) → snow on every upward-facing surface (weights not downloaded yet).
 8. Optional: diffusion winterisation of trees/ground (now: simple desaturation of foliage).
 - Snow texture at 2× zoom reads as mottled; needs comparison with real winter roofs from this distance.
 - Rust stains with strong colour still count as structures (bite out of the snow).
+- Window sills get snow only where the normals are clean; many sills stay bare.
+- Trees and foliage get no snow (red/dark foliage partly escapes the vegetation mask).
 - Real-vs-synthetic comparison waits for real winter photos (`tests/validate.py --real`).

@@ -3,3 +3,10 @@ kornia>=0.8
 opencv-python-headless>=4.9
 numpy
 rapidocr-onnxruntime>=1.3
+scipy
+scikit-image>=0.22
+scikit-learn
+pillow
+# MoGe-2 (MIT code, MIT weights): normals of the whole frame. Weights: models/moge-2-vitb-normal.pt
+# curl -L -o models/moge-2-vitb-normal.pt https://huggingface.co/Ruicheng/moge-2-vitb-normal/resolve/main/model.pt
+moge @ git+https://github.com/microsoft/MoGe.git
