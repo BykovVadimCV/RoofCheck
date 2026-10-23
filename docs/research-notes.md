@@ -72,6 +72,20 @@ Realism round 3 (critique: no aerial perspective, one texture at all distances, 
   falls; AWB shift (cooler, scaled by snow share). Batch adds real autumn photos through the same pipeline,
   labelled clean, so leafy trees are not a cue for "synthetic".
 
+Rendering round 4 (critique: snow on the target roof looks flat; depth model fine, rendering 2D):
+- Snow is lit as a height field on the slope grid (2.5 cm px): surface = smoothed depth + seam ridges that
+  widen and fade with depth (lambda 10-15 cm) + 0.5-2 m undulation; structures stand 1.5 m. Shading = CIE
+  overcast sky term from the normal x horizon-based sky visibility (8 azimuths, 1.5 m reach) + weak
+  directional term (10-30%). Close-up snow scans no longer painted on as albedo (they read as camouflage at
+  roof scale); albedo only for old snow / soot spots, weak.
+- Cover over a seam = D - 25 mm x (1 - exp(-D/120)): snow mounds over seams, so seams fade instead of
+  showing as dark slashes through 6 cm of snow.
+- Exposure: in 75% of samples the brightest snow sits at 0.88-0.97 of the host's white point, 25% allowed to
+  clip. Before: 16-83% of snow pixels clipped in many samples.
+- Railing in front of snow: soft matte keyed on bar darkness instead of a binary mask (no dashed bars).
+- Bug found by the new shading: wind scour removed snow from a hard-edged rectangle (upwind half minus
+  drift area), leaving a step in the depth map. Now a smooth weight.
+
 Open:
 - Small or partly hidden crowns keep their leaves; outlines on the nearest roofs look slightly torn.
 8. Optional: diffusion winterisation of trees/ground (now: simple desaturation of foliage).

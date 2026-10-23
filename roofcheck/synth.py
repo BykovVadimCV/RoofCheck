@@ -280,8 +280,10 @@ def accumulate(Hg, Wg, layers, weather, pitch_deg, rng) -> tuple[np.ndarray, dic
     # the drifted volume comes from the upwind half of the roof (scour), so the total is conserved
     V = float(drift.sum())
     ux = np.arange(Wg)[None, :] / max(Wg - 1, 1)
-    upwind = (ux < 0.5) if weather["wind_u"] > 0 else (ux > 0.5)
-    src = D * (upwind & ~(drift > 0))
+    side = (0.5 - ux) if weather["wind_u"] > 0 else (ux - 0.5)
+    upwind = 1 / (1 + np.exp(-side / 0.08))                         # smooth, no step at mid-roof
+    no_drift = 1 - np.clip(ndi.gaussian_filter((drift > 0).astype(np.float32), 0.5 * P) * 2, 0, 1)
+    src = D * upwind * no_drift
     if src.sum() > 0 and V > 0:
         frac = min(V / src.sum(), 0.6)
         D = D - src * frac + drift * (frac * src.sum() / V)
@@ -398,7 +400,10 @@ def snow_radiance(img, p: hostmatch.HostParams, metal_bgr, rng) -> tuple[np.ndar
     return snow.astype(np.float32), {"snow_vs_white": round(float(r), 3)}
 
 
-def shade_field(D, layers, rng):
+SHADING = "surface"          # "surface": light the snow height field; "flat": v3 overlay shading (for comparison)
+
+
+def shade_field_flat(D, layers, rng):
     P = PX_PER_M
     Dm = ndi.gaussian_filter(D, 0.08 * P) / 1000.0
     gy, gx = np.gradient(Dm * P)
@@ -409,10 +414,92 @@ def shade_field(D, layers, rng):
     if rng.random() < 0.35:
         specks = (fbm(D.shape, 0.06 * P, 2, rng) > rng.uniform(2.6, 3.2)).astype(np.float32)
         grain -= 0.08 * ndi.gaussian_filter(specks, 0.7)
-    # seams print through only while the layer is about as thin as the seam is tall
     drape = ndi.gaussian_filter(layers["seams"].astype(np.float32), 0.04 * P) * np.exp(-np.clip(D - 5, 0, None) / 15.0)
     s = (shade + ao + grain - 0.06 * drape) * layers["illum"]
     return np.clip(s, 0.6, 1.08).astype(np.float32)
+
+
+def snow_surface(D, layers, rng) -> np.ndarray:
+    """Height of the snow surface above the slope plane, mm, on the slope grid (2.5 cm px).
+    Standing seams (25 mm) are buried by the layer but print through as soft ridges whose height and
+    sharpness fade with depth (lambda ~ 10-15 cm); deep snow carries gentle 0.5-2 m undulation."""
+    P = PX_PER_M
+    seams = layers["seams"].astype(np.float32)
+    lam = rng.uniform(100, 150)
+    near = ndi.gaussian_filter(seams, 0.03 * P)                  # ridge under thin snow
+    wide = ndi.gaussian_filter(seams, 0.10 * P)                  # broad swell under deep snow
+    near, wide = near / (near.max() + 1e-6), wide / (wide.max() + 1e-6)
+    k = np.clip(D / 60.0, 0, 1)                                  # ridge widens as it is buried
+    ridge = SEAM_HEIGHT_MM * ((1 - k) * near + k * wide) * np.exp(-D / lam)
+    und = (0.6 * fbm(D.shape, rng.uniform(0.5, 1.0) * P, 3, rng) + 0.4 * fbm(D.shape, rng.uniform(1.5, 2.5) * P, 2, rng))
+    und_amp = np.clip(D * rng.uniform(0.05, 0.12), 0, 40)
+    Ds = ndi.gaussian_filter(D, 0.04 * P)                        # snow surfaces are smooth at the cm scale
+    h = Ds + ridge * (D > 1) + und * und_amp
+    h = np.where(layers["structure"], 1500.0, h)                 # chimneys and boxes stand ~1.5 m
+    return h.astype(np.float32)
+
+
+def horizon_visibility(h_mm, px_mm, dirs=8, steps=(2, 4, 8, 16, 32, 56)):
+    """Share of the sky dome each point sees over the height field (horizon-based ambient occlusion):
+    for each azimuth the highest elevation angle to the terrain within ~1.5 m."""
+    H, W = h_mm.shape
+    pad = max(steps) + 1
+    hp = np.pad(h_mm, pad, mode="edge")                         # no wrap-around: edges see open sky
+    vis = np.zeros((H, W), np.float32)
+    for a in np.linspace(0, 2 * np.pi, dirs, endpoint=False):
+        dx, dy = np.cos(a), np.sin(a)
+        mx = np.zeros((H, W), np.float32)
+        for st in steps:
+            sx, sy = int(round(dx * st)), int(round(dy * st))
+            sh = hp[pad + sy:pad + sy + H, pad + sx:pad + sx + W]
+            dist = np.hypot(sx, sy) * px_mm + 1e-6
+            mx = np.maximum(mx, (sh - h_mm) / dist)
+        vis += 1 - np.sin(np.arctan(np.clip(mx, 0, None)))
+    return vis / dirs
+
+
+def shade_surface(D, layers, pitch_deg, rng):
+    """Light the snow height field as an overcast sky would: a sky term from the surface normal (CIE
+    overcast: zenith ~3x horizon, so up-facing parts are brighter), occlusion by nearby relief (seam
+    hollows, foot of chimneys and drifts), and a weak directional term from the brighter part of the
+    cloud. Albedo varies only slightly (old or dirty snow), there is no pixel-scale texture painting:
+    at this distance the look of snow comes from its form."""
+    P = PX_PER_M
+    px_mm = 1000.0 / P
+    h = snow_surface(D, layers, rng)
+    gy, gx = np.gradient(h, px_mm)
+    n = np.dstack([-gx, -gy, np.ones_like(h)])
+    n /= np.linalg.norm(n, axis=2, keepdims=True)
+    p = np.radians(pitch_deg)
+    up = np.array([0.0, -np.sin(p), np.cos(p)])                   # rows run ridge -> eave, so up is -y
+    cos_up = n @ up
+    sky = (1 + 2 * np.clip(cos_up, -1, 1)) / 3                   # CIE overcast irradiance shape
+    vis = horizon_visibility(h, px_mm)
+    az, el = rng.uniform(0, 2 * np.pi), np.radians(rng.uniform(25, 55))
+    l_world = np.array([np.cos(el) * np.cos(az), np.cos(el) * np.sin(az), np.sin(el)])
+    # world (x east-ish along the eave, y horizontal into the roof, z up) -> slope frame
+    R = np.array([[1, 0, 0], [0, np.cos(p), -np.sin(p)], [0, np.sin(p), np.cos(p)]])
+    l = R.T @ l_world
+    l = np.array([l[0], -l[1], l[2]])
+    direct = np.clip(n @ l, 0, None)
+    kd = rng.uniform(0.1, 0.3)
+    E = (1 - kd) * sky * (0.35 + 0.65 * vis) + kd * direct
+    flat_ref = (1 - kd) * (1 + 2 * up[2]) / 3 * (0.35 + 0.65 * np.median(vis)) + kd * max(float(np.array([0, 0, 1.0]) @ l), 0)
+    s = E / max(float(flat_ref), 1e-3)
+    albedo = 1 - rng.uniform(0.0, 0.04) * np.clip(0.5 + 0.5 * fbm(D.shape, rng.uniform(2, 5) * P, 3, rng), 0, 1)
+    if rng.random() < 0.3:                                       # soot / dirt spots on old snow
+        dirt = (fbm(D.shape, rng.uniform(0.3, 0.8) * P, 3, rng) > rng.uniform(1.6, 2.3)).astype(np.float32)
+        albedo -= rng.uniform(0.04, 0.12) * ndi.gaussian_filter(dirt, 0.08 * P)
+    grain = 1 + 0.008 * fbm(D.shape, 0.03 * P, 2, rng)            # sub-pixel at this range
+    s = s * albedo * grain * layers["illum"]
+    return np.clip(s, 0.45, 1.15).astype(np.float32)
+
+
+def shade_field(D, layers, rng, pitch_deg=25.0):
+    srng = np.random.default_rng(int(rng.integers(1 << 31)))   # same draws from rng in both modes
+    if SHADING == "flat":
+        return shade_field_flat(D, layers, srng)
+    return shade_surface(D, layers, pitch_deg, srng)
 
 
 def photo_field_D(shape, mask, base_mm, rng, scale_px=80):
@@ -719,8 +806,11 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
         D[:] = 0
         wet[:] = 0
     beta = rng.uniform(0.35, 0.6) + 0.4 * weather["wetness"]       # wetter snow whitens faster
-    alpha_g = opacity(np.where(layers["seams"], np.clip(D - SEAM_HEIGHT_MM, 0, None), D), beta)
-    shade_g = shade_field(D, layers, rng)
+    # over a seam the cover is D minus the seam height plus the mound the snow builds over it
+    seam_cover = np.clip(D - SEAM_HEIGHT_MM * (1 - np.exp(-D / 120.0)), 0, None) if SHADING == "surface" \
+        else np.clip(D - SEAM_HEIGHT_MM, 0, None)
+    alpha_g = opacity(np.where(layers["seams"], seam_cover, D), beta)
+    shade_g = shade_field(D, layers, rng, geom["pitch_deg"])
 
     # cornice lip beyond the eave on the leeward side of deep snow
     ext = 0
@@ -795,6 +885,18 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
         bg, graded = winter_grade(bg, rng, veg, sky_rgb, weather["ground_mm"])
     bg = bg * Wd[..., None]
 
+    # exposure: most phones keep snow just under their white point; some frames do clip
+    clip_info = "free"
+    sel = on_slope & (A > 0.9)
+    if SHADING == "surface" and sel.sum() > 500 and not null:
+        cl = float(np.min(host.clip_hi))
+        hz = float(hostmatch.apply_haze(snow[None, None, :], host).mean())
+        p98 = float(np.percentile(S[sel], 98)) * hz
+        if rng.random() < 0.75:
+            snow = snow * (cl * rng.uniform(0.88, 0.97) / max(p98, 1))
+            clip_info = "under_white_point"
+        else:
+            clip_info = "allowed_to_clip"
     snow_hz = hostmatch.apply_haze(snow[None, None, :], host)                    # (1,1,3)
     tex_p = 1 + 0.03 * fbm((H0, W0), 6, 3, rng)
     alpha = A * on_slope
@@ -821,8 +923,15 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     capm = (cap_struct | cap_rail).astype(np.float32)
     col = np.where(capm[..., None] > 0, snow_hz * 0.97, col)
     alpha = np.maximum(alpha, capm)
-    keep_front = (fence_p | struct_p) & ~(cap_rail | cap_struct)
+    keep_front = struct_p & ~cap_struct
     alpha = np.where(keep_front, 0, alpha)
+    # railing in front of the snow: a soft matte keyed on how much darker each bar is than the roof behind
+    # it, inside the railing zone; thin bars come out whole instead of as dashed mask fragments
+    zone = cv2.dilate(to_photo(layers["fence"].astype(np.float32)), np.ones((7, 7), np.uint8)) > 0.2
+    g_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    bar = np.clip((cv2.GaussianBlur(g_img, (0, 0), 3) - g_img - 4) / 18, 0, 1)
+    fence_w = np.where(zone, bar, 0) * ~cap_rail
+    alpha = alpha * (1 - fence_w)
     pm, ab = hostmatch.blur_layer(col * alpha[..., None], alpha.astype(np.float32), host)
     out = bg * (1 - ab[..., None]) + pm
     weight = cv2.GaussianBlur((ab > 0.02).astype(np.float32), (0, 0), 2.0)
@@ -866,7 +975,7 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
             "neighbour_frac": round(float(neigh.mean()), 3), "neighbour_snow_frac": round(float((Dn >= label_tau_mm).mean()), 3),
             **w_info, "contrast_vs_distance": aer["curve"] if aer else None, "scene_normals": scene is not None,
             "up_vector": [round(float(v), 3) for v in scene.up] if scene is not None else None,
-            "bare_trees_frac": round(graded, 3), "white_balance_shift": wb, "exposure": round(e, 3), "label_tau_mm": label_tau_mm, "null": null,
+            "bare_trees_frac": round(graded, 3), "shading": SHADING, "exposure_mode": clip_info, "white_balance_shift": wb, "exposure": round(e, 3), "label_tau_mm": label_tau_mm, "null": null,
             "host": host.as_dict()}
     return Sample(out, depth, cls, roi, cov, info)
 

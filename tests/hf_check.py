@@ -13,7 +13,7 @@ res = {}
 for d in sys.argv[1:]:
     r_snow, r_fac = [], []
     for f in sorted(glob.glob(f"{d}/*_cls.png")):
-        sid = Path(f).name[:-8]; bg = re.sub(r"_\d{3}_.*$", "", sid)
+        sid = Path(f).name[:-8]; bg = re.sub(r"_(\d{3}|neg\d+)_.*$", "", sid)
         im = cv2.imread(f"{d}/{sid}.jpg", 0).astype(np.float32); o = cv2.imread(str(orig[bg]), 0).astype(np.float32)
         cls = cv2.imread(f, 0); dep = cv2.imread(f"{d}/{sid}_depth.png", -1) / 10.0
         m = cv2.erode(((cls == 1) & (dep >= 20)).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
