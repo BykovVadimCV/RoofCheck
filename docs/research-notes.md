@@ -108,8 +108,13 @@ Generator v5 (3D):
 - Clearing: panel-wise residue, scrape streaks, seam-foot and cross-joint lines, wet variant with slush.
 - Ice crust near the eave, gutter ice edge, icicles (class `ice`); snow-laden crowns; snowfall mode;
   ground snow tail to 800 mm; `_seams.png` label = client's criterion (cover over seam tops <= 12 mm).
-- Known: slope depth from 3D (8.3 m on the demo roof) differs from the prior (4.1 m), so grid rows are
-  anisotropic; to be set from the 3D frame.
+- Slope eave-to-ridge size now taken from the 3D frame when available (demo roof: 9.75 m vs 4.1 m prior).
+- Snow surface: body low-passed at 0.3-0.5 m, broad low swells only (cm-scale relief read as crumpled paper).
+- World snow mask (`normals.roofness`): up-facing in both network and point-map normals, consistent SLIC
+  segments, leaf-colour + busy-texture segments dropped. Near deep surfaces get their own plane and the
+  same 3D solid + ray march (`snow3d.surface_frames/render_surfaces`); far ones keep the 2.5D painter.
+- Trees: crown structure kept, colour drained to grey-brown, lifted toward haze. Procedural see-through and
+  snow-laden crowns read as smudges / camouflage; proper winter trees need generative editing (item 8).
 
 Open:
 - Small or partly hidden crowns keep their leaves; outlines on the nearest roofs look slightly torn.

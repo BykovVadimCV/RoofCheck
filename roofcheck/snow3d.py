@@ -37,6 +37,7 @@ class RoofFrame:
     m_per_v: float           # metres per grid px along v
     pitch_deg: float
     fit_rms: float
+    scale: float = 1.0       # model units -> metres
 
 
 def _base(Kinv, n, d, px, py):
@@ -96,7 +97,7 @@ def roof_frame(K, depth, valid, quad, M, Hg, Wg, length_m, up, normal=None, igno
     pitch = float(np.degrees(np.arccos(np.clip(abs(n @ up), -1, 1))))
     if not (3 < pitch < 70):
         return None
-    return RoofFrame(K, Kinv, n, d, M, np.linalg.inv(M), ex, ey, float(m_u), float(m_v), pitch, rms)
+    return RoofFrame(K, Kinv, n, d, M, np.linalg.inv(M), ex, ey, float(m_u), float(m_v), pitch, rms, float(s))
 
 
 # ------------------------------------------------------------------ the snow solid
@@ -129,14 +130,13 @@ def smooth_relief(D_mm, seams, freshness, rng, P=PX_PER_M):
     return np.clip(base + swell * amp + ridge, 0, None).astype(np.float32)
 
 
-def solid_height(D_mm, cut, near_struct, freshness, rng, relief_mm=None):
+def solid_height(D_mm, cut, near_struct, freshness, rng, relief_mm=None, P=PX_PER_M):
     """Height of the snow surface above the roof plane, metres, with rounded edges.
 
     The profile at a free edge is a quarter ellipse of radius R = k x local depth (k: fresh 1.2-2.0,
     settled 0.5-1.0, wet 0.2-0.45), i.e. fresh snow ends in a soft rounded nose, settled snow in a
     shallower one. At shovel cuts R is ~0.15 x depth (near-vertical wall with a softened top). Against
     structures snow banks up (a fillet) instead of rounding away."""
-    P = PX_PER_M
     k = {"fresh": rng.uniform(1.2, 2.0), "settled": rng.uniform(0.5, 1.0), "wet": rng.uniform(0.2, 0.45)}[freshness]
     snow = D_mm > 3
     dist_m = ndi.distance_transform_edt(np.pad(snow, 1))[1:-1, 1:-1] / P
@@ -309,3 +309,90 @@ def render_bbox(fr: RoofFrame, quad, H_m, shape, margin_px=8):
     x0, y0 = np.floor(allp.min(0)).astype(int) - margin_px
     x1, y1 = np.ceil(allp.max(0)).astype(int) + margin_px
     return max(0, x0), max(0, y0), min(W0, x1), min(H0, y1)
+
+
+# ------------------------------------------------------------------ snow on the other roofs, in 3D
+def surface_frames(scene, mask, scale, min_lift_px=3.0, D_mm=None, max_frames=12):
+    """One plane per connected snow-bearing surface that is near and deep enough for its thickness to show
+    (lift > min_lift_px). Plane from the surface normals and depth of its own pixels; grid on the plane at
+    roughly photo resolution. Returns a list of (frame, component mask, grid shape)."""
+    H0, W0 = mask.shape
+    lbl, n = ndi.label(mask)
+    if n == 0 or scene.K is None:
+        return []
+    Kinv = np.linalg.inv(scene.K)
+    f = float(scene.K[0, 0])
+    out = []
+    sizes = ndi.sum(mask, lbl, range(1, n + 1))
+    for i in np.argsort(-sizes)[:max_frames * 3]:
+        comp = lbl == (i + 1)
+        if comp.sum() < 400:
+            continue
+        ys, xs = np.nonzero(comp)
+        z = scene.depth[ys, xs] * scale
+        if not np.isfinite(z).all() or (z <= 0).any():
+            continue
+        ppm = f / np.median(z)                                  # photo px per metre at this distance
+        dmax = float(np.percentile(D_mm[comp], 95)) if D_mm is not None else 300.0
+        if dmax / 1000.0 * ppm < min_lift_px:
+            continue
+        N = scene.normal[ys, xs].astype(np.float64)
+        N /= np.linalg.norm(N, axis=1, keepdims=True) + 1e-9
+        nrm = np.median(N, 0); nrm /= np.linalg.norm(nrm)
+        Pt = ((Kinv @ np.vstack([xs, ys, np.ones_like(xs)])) * z).T
+        if nrm @ (-np.median(Pt, 0)) < 0:
+            nrm = -nrm
+        d = float(np.median(Pt @ nrm))
+        up = scene.up
+        e1 = np.cross(up, nrm)
+        if np.linalg.norm(e1) < 0.2:                            # near-flat roof: any horizontal axis
+            e1 = np.cross(nrm, np.array([0.0, 0.0, 1.0]))
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(nrm, e1)
+        base = Pt - np.outer(Pt @ nrm - d, nrm)                 # pixels projected onto the plane
+        c = base.mean(0)
+        u, v = (base - c) @ e1, (base - c) @ e2
+        res = float(np.clip(ppm, 5, 40))                        # grid px per metre ~ photo resolution
+        u0, v0 = u.min() - 0.5, v.min() - 0.5
+        Wg = int((u.max() + 0.5 - u0) * res) + 1
+        Hg = int((v.max() + 0.5 - v0) * res) + 1
+        if Wg * Hg > 4_000_000 or Wg < 8 or Hg < 8:
+            continue
+        o = c + e1 * u0 + e2 * v0
+        G2P = scene.K @ np.column_stack([e1 / res, e2 / res, o])
+        M = np.linalg.inv(G2P)
+        pitch = float(np.degrees(np.arccos(np.clip(abs(nrm @ up), -1, 1))))
+        fr = RoofFrame(scene.K, Kinv, nrm, d, M, G2P, e1, e2, 1 / res, 1 / res, pitch, 0.0, scale)
+        out.append((fr, comp, (Hg, Wg)))
+        if len(out) >= max_frames:
+            break
+    return out
+
+
+def render_surfaces(frames, D_mm, scene, freshness, rng, shape):
+    """Ray-march the snow solid of each surface frame. Returns photo maps: hit, shade S, depth D."""
+    H0, W0 = shape
+    hit = np.zeros(shape, bool)
+    S = np.zeros(shape, np.float32)
+    Dp = np.zeros(shape, np.float32)
+    for fr, comp, (Hg, Wg) in frames:
+        M = fr.M / fr.M[2, 2]
+        Dg = cv2.warpPerspective((D_mm * comp).astype(np.float32), M, (Wg, Hg), flags=cv2.INTER_LINEAR)
+        if Dg.max() < 5:
+            continue
+        res = 1.0 / fr.m_per_u
+        rel = smooth_relief(Dg, np.zeros_like(Dg, bool), freshness, rng, P=res)
+        Hm, _ = solid_height(Dg, None, None, freshness, rng, relief_mm=rel, P=res)
+        Sg, _ = shade3d(Hm, fr, scene.up, np.zeros_like(Hm), rng)
+        ys, xs = np.nonzero(comp)
+        lift = float(Hm.max()) * float(scene.K[0, 0]) / max(float(np.median(scene.depth[ys, xs])) * fr.scale, 1e-3)
+        bbox = (max(xs.min() - 4, 0), max(int(ys.min() - lift * 1.5) - 4, 0),
+                min(xs.max() + 5, W0), min(ys.max() + 5, H0))
+        R = raymarch(fr, Hm, {"S": Sg, "D": Dg}, shape, bbox, step_m=max(0.012, fr.m_per_u * 0.5))
+        if R is None:
+            continue
+        new = R["hit"] & ~hit
+        hit |= new
+        S[new] = R["S"][new]
+        Dp[new] = R["D"][new]
+    return hit, S, Dp

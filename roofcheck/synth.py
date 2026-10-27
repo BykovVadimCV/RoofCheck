@@ -1036,6 +1036,17 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     if host is None:
         q = np.asarray(quad)
         host = hostmatch.estimate(img, (q[:, 0].min(), q[:, 1].min(), q[:, 0].max(), q[:, 1].max()), ignore=ov.mask)
+    geom = dict(geom)
+    fr0 = None
+    if scene is not None and getattr(scene, "K", None) is not None:
+        geo_p = slope_geometry(quad, geom)
+        sp = np.zeros((H0, W0), np.uint8)
+        for sp_ in structures or []:
+            cv2.fillPoly(sp, [np.round(np.asarray(sp_)).astype(np.int32)], 1)
+        fr0 = snow3d.roof_frame(scene.K, scene.depth, scene.valid, quad, geo_p.M, geo_p.H, geo_p.W, geom["length_m"],
+                                scene.up, normal=scene.normal, ignore=(sp > 0) | (ov.mask > 0))
+        if fr0 is not None:                     # eave-to-ridge size measured in 3D, not the prior
+            geom["depth_m"] = round(float(np.clip(fr0.m_per_v * geo_p.H, 2.0, 15.0)), 2)
     geo = slope_geometry(quad, geom)
     Hg, Wg = geo.H, geo.W
     rect = cv2.warpPerspective(img, geo.M, (Wg, Hg), flags=cv2.INTER_LINEAR)
@@ -1250,9 +1261,31 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
         wb = np.clip(np.log2(np.clip(r, 1, None)) / 3, 0, 1)[..., None]
         col_w = col_w * (1 - wb) + cv2.GaussianBlur(col_w, (0, 0), 1.2) * wb
         a_n = a_n * (1 - wb[..., 0]) + cv2.GaussianBlur(a_n, (0, 0), 1.0) * wb[..., 0]
-        # thickness: lift the snow by its height (per-pixel metres-to-pixels) so fronts show a face
+        # near, deep surfaces: the snow solid on each surface's own fitted plane, ray-marched
+        n3d = 0
+        big = np.zeros((H0, W0), bool)
+        if fr0 is not None and SHADING == "surface":
+            frames = snow3d.surface_frames(scene, neigh & (Dn > 3), fr0.scale, D_mm=Dn)
+            n3d = len(frames)
+            if frames:
+                hit_w, S_w, D_w = snow3d.render_surfaces(frames, Dn, scene, freshness, rng, (H0, W0))
+                cn = snow_hz * (S_w * (1 + 0.35 * (under - 1)))[..., None]
+                cw3 = cn if aer["V"] is None else aer["V"] + aer["c"][..., None] * (cn - aer["V1"])
+                col_w = np.where(hit_w[..., None], cw3, col_w)
+                a_w3 = np.where(D_w > 15, 1.0, opacity(D_w, beta))
+                for _, comp, _ in frames:
+                    big |= comp
+                a_n = np.where(hit_w, a_w3, np.where(big, 0, a_n))
+                Dn = np.where(hit_w, np.maximum(Dn, D_w), np.where(big, 0, Dn))
+                neigh = (neigh & ~big) | hit_w
+                big = hit_w
+        w_info["world_3d_surfaces"] = n3d
+        # thickness elsewhere: lift the snow by its height (per-pixel metres-to-pixels) so fronts show a face
         face_w = col_w * np.array([0.84, 0.82, 0.80], np.float32)[None, None, :]
-        col_w, a_n, Dn_l, face_n = paint_heightfield(col_w, a_n, Dn, neigh & (a_n > 0.02), ppm_w, face_w, rng)
+        rest = neigh & (a_n > 0.02) & ~big
+        col_p, a_p, Dn_l, face_n = paint_heightfield(col_w, a_n * rest, Dn * rest, rest, ppm_w, face_w, rng)
+        col_w = np.where(big[..., None], col_w, np.where((a_p > 0)[..., None], col_p, col_w))
+        a_n = np.where(big, a_n, np.maximum(a_n * ~rest, a_p))
         Dn = np.maximum(Dn, Dn_l)
         neigh = neigh | (a_n > 0.3)
         col = np.where((a_n > alpha)[..., None], col_w, col)
