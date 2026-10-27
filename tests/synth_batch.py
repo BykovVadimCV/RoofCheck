@@ -8,6 +8,7 @@ camera parameters and MoGe-2 normals (snow on every upward-facing surface) once 
   <id>_depth.png         uint16, 0.1 mm, all snow-bearing surfaces
   <id>_cls.png           class map (schema.SEG_CLASSES)
   <id>_roi.png           visible target slope
+  <id>_seams.png         client criterion: 1 seams visible, 0 hidden, 255 outside the ROI
   <id>_t{T}.png          binary label at threshold T mm (0/1, 255 = ignore band / overlays)
   <id>.json              parameters
 Plus N_NEG (2nd argument, default 2) real photos per background through the same pipeline without snow,
@@ -74,6 +75,8 @@ for bg_name, im, path, P in bgs:
         cv2.imwrite(str(OUT / f"{sid}_depth.png"), np.clip(s.depth_mm * 10, 0, 65535).astype(np.uint16))
         cv2.imwrite(str(OUT / f"{sid}_cls.png"), s.classes)
         cv2.imwrite(str(OUT / f"{sid}_roi.png"), s.roi.astype(np.uint8) * 255)
+        if s.seams is not None:
+            cv2.imwrite(str(OUT / f"{sid}_seams.png"), s.seams)
         for T in synth.THRESHOLDS_MM:
             cv2.imwrite(str(OUT / f"{sid}_t{T}.png"), synth.labels_at(s.depth_mm, s.classes, T))
         meta = {"id": sid, "background": bg_name, "coverage": {str(k_): v for k_, v in s.coverage.items()}, **s.info,
