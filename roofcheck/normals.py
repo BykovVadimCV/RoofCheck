@@ -31,6 +31,7 @@ class Geometry:
     tilt_deg: np.ndarray      # H x W, angle between surface normal and up
     mu: np.ndarray            # H x W, snow shape factor by tilt
     depth: np.ndarray         # H x W, metres (relative scale is reliable, absolute is approximate)
+    K: np.ndarray | None = None   # 3x3 camera intrinsics in pixels
 
 
 def fit_up(n: np.ndarray, valid: np.ndarray, iters: int = 6) -> np.ndarray:
@@ -77,7 +78,8 @@ class NormalEstimator:
         f = CACHE / f"{key}.npz"
         if f.exists():
             d = np.load(f)
-            return {k: d[k] for k in d.files}
+            if "intrinsics" in d.files:
+                return {k: d[k] for k in d.files}
         import torch
         import warnings
         m = self._load()
@@ -86,7 +88,8 @@ class NormalEstimator:
             warnings.simplefilter("ignore")
             o = m.infer(x, resolution_level=0, use_fp16=False)
         d = {"normal": o["normal"].numpy().astype(np.float16), "mask": o["mask"].numpy().astype(bool),
-             "depth": o["depth"].numpy().astype(np.float16)}
+             "depth": o["depth"].numpy().astype(np.float32),
+             "intrinsics": o["intrinsics"].numpy().astype(np.float64)}   # normalised: fx/W, fy/H, cx/W, cy/H
         CACHE.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(f, **d)
         return d
@@ -103,7 +106,11 @@ class NormalEstimator:
         tilt[~valid] = np.nan
         mu = mu_from_tilt(np.nan_to_num(tilt, nan=90.0))
         depth = np.nan_to_num(d["depth"].astype(np.float32), nan=0.0, posinf=0.0)
-        return Geometry(n, valid, up, tilt, mu, depth)
+        K = None
+        if "intrinsics" in d:
+            Hh, Ww = img_bgr.shape[:2]
+            K = np.array(d["intrinsics"], np.float64) * np.array([[Ww], [Hh], [1.0]])
+        return Geometry(n, valid, up, tilt, mu, depth, K)
 
 
 def pitch_of(geo: Geometry, mask: np.ndarray) -> float | None:

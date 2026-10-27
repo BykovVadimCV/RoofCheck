@@ -86,6 +86,31 @@ Rendering round 4 (critique: snow on the target roof looks flat; depth model fin
 - Bug found by the new shading: wind scour removed snow from a hard-edged rectangle (upwind half minus
   drift area), leaving a step in the depth map. Now a smooth weight.
 
+Photo survey (Oct 2026, ~100 contractor/maintenance photos of Moscow roofs, Yandex Images):
+- Cleared roofs are often nearly as white as snowy ones: thin frosty film with scrape streaks down the slope,
+  residue varying panel by panel (each shovel pass runs down one panel), white lines at the foot of seams and
+  in cross-joints; after a thaw, dark wet metal with slush. Whiteness alone does not separate the classes.
+- Thick snow shows only where it meets something: railing half buried, a rounded overhang past the gutter
+  (ice edge and icicles below), vertical cut faces (bright top, blue-grey face), blocks when cut, snow
+  pillows on cornices and sills; the body itself is a smooth dome, seams gone.
+- Thin fresh snow: uniform white, seams as faint lines, slopes of different orientation differ in tone.
+- Scene: after snowfalls trees are often white (snow/hoarfrost); snowfall flattens contrast; ice is
+  translucent blue-grey and glossy.
+
+Generator v5 (3D):
+- `roofcheck/snow3d.py`: roof plane in camera space from MoGe-2 normals (orientation) + depth (offset) +
+  intrinsics, scaled by the eave length; snow solid = height field on the plane with rounded edges
+  (quarter-ellipse, radius = k x depth; k fresh 1.2-2.0, settled 0.5-1.0, wet 0.2-0.45; shovel cuts ~0.15),
+  banked against structures; eave band and overhang smoothed along the eave. Rendered by ray marching
+  every photo pixel against the solid (occlusion, walls, noses, overhang from the geometry); lit by the 3D
+  normal vs the fitted up vector (overcast sky term x horizon visibility + weak directional light).
+  Painter (2.5D) kept as fallback when no plane can be fitted.
+- Clearing: panel-wise residue, scrape streaks, seam-foot and cross-joint lines, wet variant with slush.
+- Ice crust near the eave, gutter ice edge, icicles (class `ice`); snow-laden crowns; snowfall mode;
+  ground snow tail to 800 mm; `_seams.png` label = client's criterion (cover over seam tops <= 12 mm).
+- Known: slope depth from 3D (8.3 m on the demo roof) differs from the prior (4.1 m), so grid rows are
+  anisotropic; to be set from the 3D frame.
+
 Open:
 - Small or partly hidden crowns keep their leaves; outlines on the nearest roofs look slightly torn.
 8. Optional: diffusion winterisation of trees/ground (now: simple desaturation of foliage).

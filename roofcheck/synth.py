@@ -33,7 +33,7 @@ import cv2
 import numpy as np
 from scipy import ndimage as ndi
 
-from . import hostmatch, normals, overlays
+from . import hostmatch, normals, overlays, snow3d
 from .schema import SEG_CLASSES
 
 CLS = {k: i for i, (k, _) in enumerate(SEG_CLASSES)}
@@ -400,6 +400,7 @@ def apply_state(D, state, layers, weather, vis, rng, tau):
             m = (np.arange(Hg)[:, None] > Hg - rng.uniform(0.8, 2.2) * P) & np.ones((1, Wg), bool)
         m = warp_mask(m, rng, 0.2 * P, 2 * P)
         R, a = cleared_residue(Hg, Wg, layers, rng, wet=wet_clear)
+        info["_cut"] = m
         D = np.where(m, R, D)
         alb = np.where(m, a, 1.0)
         if wet_clear:
@@ -1041,6 +1042,8 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     state = state or str(rng.choice(STATES, p=STATE_P))
     D, acc_info = accumulate(Hg, Wg, layers, weather, geom["pitch_deg"], rng)
     D, wet, alb_g, st_info = apply_state(D, state, layers, weather, vis, rng, label_tau_mm)
+    cut_g = st_info.pop("_cut", None)
+    freshness = "wet" if (state == "thaw" or weather["wetness"] > 0.5) else ("fresh" if rng.random() < 0.5 else "settled")
     D = roughen(D, layers, state, rng)
     ice_g = ice_grid(Hg, Wg, state, rng) * (D < 5)
     if null:
@@ -1061,8 +1064,9 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     p_lip = np.clip((d_eave_mean - 80) / 300, 0, 0.85)
     if not null and state in ("not_cleared", "partially_cleared") and rng.random() < p_lip:
         ext = int(np.clip(d_eave_mean / 1000 * rng.uniform(0.4, 1.0), 0.08, 0.5) * PX_PER_M)
-        lip = np.repeat(D[-1:, :], ext, 0) * np.clip(np.linspace(1, 0, ext)[:, None] ** rng.uniform(0.6, 1.5)
-                                                     + 0.25 * fbm((ext, Wg), 0.3 * PX_PER_M, 3, rng), 0, 1)
+        d_row = ndi.gaussian_filter1d(D[Hg - int(0.3 * PX_PER_M):Hg].max(0), 0.4 * PX_PER_M)
+        lip = np.repeat(d_row[None, :], ext, 0) * np.clip(np.linspace(1, 0, ext)[:, None] ** rng.uniform(0.6, 1.5)
+                                                          + 0.08 * fbm((ext, Wg), 1.0 * PX_PER_M, 2, rng), 0, 1)
         lip[lip < 30] = 0
         D = np.vstack([D, lip.astype(np.float32)])
         alpha_g = np.vstack([alpha_g, opacity(lip, beta)])
@@ -1070,6 +1074,39 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
         wet = np.vstack([wet, np.zeros((ext, Wg), np.float32)])
         ice_g = np.vstack([ice_g, np.zeros((ext, Wg), np.float32)])
     Hx = D.shape[0]
+
+    # ---- the snow as a 3D solid on the fitted roof plane, ray-marched (see snow3d.py)
+    R3, info3 = None, {"render": "planar"}
+    if SHADING == "surface" and not null and scene is not None and getattr(scene, "K", None) is not None and D.max() > 3:
+        fr = snow3d.roof_frame(scene.K, scene.depth, scene.valid, geo.quad, geo.M, Hg, Wg, geo.length_m, scene.up,
+                               normal=scene.normal, ignore=(struct_ph > 0) | (ov.mask > 0), rng=rng)
+        if fr is not None:
+            padx = lambda a, v=0: np.vstack([a, np.full((ext, Wg), v, a.dtype)]) if ext else a
+            lay_x = {"seams": padx(layers["seams"], False), "structure": padx(layers["structure"], False)}
+            relief = snow_surface(D, lay_x, rng)
+            struct_x = lay_x["structure"]
+            H_m, sinfo = snow3d.solid_height(D, padx(cut_g, False) if cut_g is not None else None, struct_x,
+                                             freshness, rng, relief_mm=np.where(struct_x, 0, relief))
+            # the eave nose and the overhang are smooth along the eave (no per-column teeth)
+            r0 = max(Hg - int(0.4 * PX_PER_M), 0)
+            band = H_m[r0:].copy()
+            sm = ndi.gaussian_filter1d(band, sigma=0.3 * PX_PER_M, axis=1)
+            wgt = ndi.gaussian_filter1d((band > 0).astype(np.float32), sigma=0.3 * PX_PER_M, axis=1)
+            band = np.where(band > 0, sm / np.maximum(wgt, 1e-3), 0)
+            ramp = np.clip((np.arange(H_m.shape[0] - r0) / (0.15 * PX_PER_M)), 0, 1)[:, None]
+            H_m[r0:] = H_m[r0:] * (1 - ramp) + band * ramp
+            S3, nrm3 = snow3d.shade3d(H_m, fr, scene.up, struct_x.astype(np.float32), rng,
+                                      albedo=padx(alb_g, 1.0), illum=padx(layers["illum"], 1.0))
+            steep = np.clip((1 - nrm3 @ fr.n) * 4, 0, 1).astype(np.float32)      # 0 flat .. 1 wall
+            S_smooth = cv2.GaussianBlur(S3, (0, 0), 3)
+            bbox = snow3d.render_bbox(fr, geo.quad, H_m, (H0, W0))
+            R3 = snow3d.raymarch(fr, H_m, {"S": S3, "Ss": S_smooth, "steep": steep, "A": alpha_g, "D": D},
+                                 (H0, W0), bbox)
+            if R3 is not None:      # walls and noses: shading from the smooth form, not stretched seam relief
+                w = R3["steep"]
+                R3["S"] = R3["S"] * (1 - w) + R3["Ss"] * w
+            info3 = {"render": "raymarch3d", **sinfo, "roof_pitch_fit_deg": round(fr.pitch_deg, 1),
+                     "plane_fit_rms": round(fr.fit_rms, 4), "max_height_m": round(float(H_m.max()), 3)}
 
     to_photo = lambda a, interp=cv2.INTER_LINEAR, bv=0.0: cv2.warpPerspective(
         a.astype(np.float32), geo.Minv, (W0, H0), flags=interp, borderMode=cv2.BORDER_CONSTANT, borderValue=bv)
@@ -1168,7 +1205,14 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
         alpha = np.maximum(alpha, ia)
     # the snow body with its thickness: faces at the eave, walls of cleared strips, overhang over the gutter
     face_rgb = snow_hz.reshape(3) * np.array([1.04, 1.0, 0.96], np.float32)
-    if SHADING == "surface" and not null:
+    if R3 is not None:
+        hit = R3["hit"]
+        col = np.where(hit[..., None], snow_hz * R3["S"][..., None], col)
+        alpha = np.where(hit, R3["A"], alpha)
+        d_t = np.where(hit, R3["D"], np.where(on_slope, Dp, 0))
+        face = hit & ~on_slope
+        face_D = np.where(face, d_t, 0)
+    elif SHADING == "surface" and not null:
         col, alpha_t, d_t, face = paint_heightfield(col, alpha, Dp, on_slope, s_v, face_rgb, rng)
         alpha = alpha_t
         face_D = np.where(face, d_t, 0)
@@ -1278,6 +1322,7 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
             "neighbour_frac": round(float(neigh.mean()), 3), "neighbour_snow_frac": round(float((Dn >= label_tau_mm).mean()), 3),
             **w_info, "contrast_vs_distance": aer["curve"] if aer else None, "scene_normals": scene is not None,
             "up_vector": [round(float(v), 3) for v in scene.up] if scene is not None else None,
+            **info3, "freshness": freshness,
             "bare_trees_frac": round(graded, 3), "tree_mode": tree_mode, "snowfall": round(float(fall), 3),
             "ice_px": int(ice_vis.sum()), "icicles": n_ici, "buried_structure_px": int(buried.sum()),
             "face_px": int(face.sum()), "overhang_m": round(ext / PX_PER_M, 2),
