@@ -688,16 +688,17 @@ def world_snow(scene: "normals.Geometry", img, exclude, weather, state, rng, r=N
     r = np.ones((H, W), np.float32) if r is None else np.clip(r, 0.3, 50)
     ppm = (ppm_near / r).astype(np.float32)                 # photo px per metre at each pixel
     # ragged outline at metre scale: ~0.25 m wobble, i.e. several px near, sub-pixel far away
-    amp = np.clip(0.25 * ppm, 0.3, 5.0)
+    amp = np.clip(0.12 * ppm, 0.3, 3.0)
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
-    dx, dy = fbm((H, W), 18, 3, rng) * amp, fbm((H, W), 18, 3, rng) * amp
+    dx, dy = fbm((H, W), 40, 2, rng) * amp, fbm((H, W), 40, 2, rng) * amp
     m = (cv2.remap(m.astype(np.float32), xx + dx, yy + dy, cv2.INTER_LINEAR) > 0.5) & ~exclude
     lbl, n = ndi.label(m)
     base = weather["ground_mm"] * rng.uniform(0.7, 1.0)
     full = base * (1 + 0.2 * fbm((H, W), 80, 3, rng))
-    cleared = residual(H, W, rng, hi=rng.uniform(0, 3)) * (rng.random() < 0.6)
+    cleared = cv2.GaussianBlur(residual(H, W, rng, hi=rng.uniform(0, 3)), (0, 0), 2) * (rng.random() < 0.6)
     melt_thr = rng.uniform(-0.8, 0.8)
-    patchy = np.where(fbm((H, W), 40, 3, rng) < melt_thr, full, cleared)
+    patch = cv2.GaussianBlur((fbm((H, W), 60, 2, rng) < melt_thr).astype(np.float32), (0, 0), 3)
+    patchy = full * patch + cleared * (1 - patch)
     p = [0.3, 0.15, 0.55] if state == "thaw" else [0.7, 0.15, 0.15]
     st = rng.choice(3, n + 1, p=p)
     st[0] = 0
@@ -726,6 +727,7 @@ def world_snow(scene: "normals.Geometry", img, exclude, weather, state, rng, r=N
         n_drift = int(seed.sum())
     ramp = np.clip(0.06 * ppm, 0.6, 2.0)                    # ~6 cm soft edge
     D = np.clip(D, 0, None) * np.clip(0.5 + (ndi.distance_transform_edt(m) - 0.5) / (2 * ramp), 0, 1)
+    D = cv2.GaussianBlur(D.astype(np.float32), (0, 0), 1.5) * m      # no pixel-scale lumps on far roofs
     return D.astype(np.float32), m, {"world_base_mm": round(float(base), 1), "world_surfaces": int(n),
                                      "world_drift_seed_px": n_drift, "world_taper_m": round(float(taper_m), 2),
                                      "world_cleared": int((st[1:] == 1).sum()), "world_patchy": int((st[1:] == 2).sum())}
@@ -748,32 +750,36 @@ def neighbour_from_polygons(img, polys, metal_lab):
 
 
 def winter_grade(img_f, rng, veg: np.ndarray, sky_rgb, snow_mm: float = 0.0):
-    """Deciduous crowns toward bare winter trees: leaves gone means the crown is a grey-brown tangle of
-    twigs with the background showing through. Colour drained, crown thinned toward the veil colour in
-    leaf-sized holes, twigs darkened; after a heavy fall, some snow on the upper sides of branches.
-    The mask comes from colour + texture (normals.vegetation), so yellow facades are left alone."""
+    """Deciduous crowns in winter: no leaves, so a crown is a see-through haze of grey-brown twigs with the
+    background (sky, facades, roofs behind it) showing through, denser toward the trunk. The background is
+    estimated by inpainting the crown region from its surroundings; the twig layer keeps the crown's own
+    fine luminance structure (branches) but drains its colour. No pixel-scale speckle."""
     out = img_f.copy()
     if not veg.any():
         return out, 0.0
     H, W = veg.shape
     veg = cv2.morphologyEx(veg.astype(np.uint8), cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))) > 0
-    veg = ndi.binary_fill_holes(veg)                                        # whole crowns, no leafy islands
+    veg = ndi.binary_fill_holes(veg)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(veg.astype(np.uint8))
+    veg = np.isin(lab, 1 + np.flatnonzero(st[1:, cv2.CC_STAT_AREA] >= 300))
+    if not veg.any():
+        return out, 0.0
     w = cv2.GaussianBlur(veg.astype(np.float32), (0, 0), 2.0)
-    lum = out.mean(2)
-    loc = cv2.GaussianBlur(lum, (0, 0), 6)
-    detail = lum - loc                                                       # branch structure, kept
-    bark = np.array([0.95, 0.99, 1.04], np.float32)[None, None, :]          # BGR: grey with a brown cast
-    grey = (loc * rng.uniform(0.72, 0.85))[..., None] * bark + 0.8 * detail[..., None]
-    gaps = np.clip(0.5 + 0.6 * fbm((H, W), rng.uniform(8, 14), 3, rng), 0, 1)
-    gaps = cv2.GaussianBlur(gaps, (0, 0), 1.0)[..., None]                   # leaf-cluster sized openings
-    veil = np.full((1, 1, 3), float(np.mean(sky_rgb)) * rng.uniform(0.85, 0.97), np.float32)   # neutral
-    crown = grey * (1 - 0.3 * gaps) + veil * 0.3 * gaps
-    if snow_mm > 80:                                                        # snow along the crowns' tops
-        top = veg & (np.roll(veg, 3, axis=0) == 0)
-        top = cv2.GaussianBlur(ndi.binary_dilation(top, np.ones((2, 3))).astype(np.float32), (0, 0), 0.8)
-        crown = crown * (1 - 0.7 * top[..., None]) + veil * 1.08 * 0.7 * top[..., None]
-    k = rng.uniform(0.85, 1.0)
-    out = out * (1 - k * w[..., None]) + crown * (k * w[..., None])
+    # crown keeps its own structure (twigs and limbs = the existing fine detail); colour drained to grey-brown,
+    # contrast lowered and lifted toward the haze, as a leafless crown reads from a distance
+    lum = img_f.mean(2)
+    fine = lum - cv2.GaussianBlur(lum, (0, 0), 1.5)
+    base = cv2.GaussianBlur(lum, (0, 0), 6)
+    veil = float(np.mean(sky_rgb))
+    t = rng.uniform(0.15, 0.35)
+    crown_l = (base * rng.uniform(0.7, 0.85)) * (1 - t) + veil * t + 0.7 * fine
+    crown = np.clip(crown_l, 10, 235)[..., None] * np.array([0.94, 0.98, 1.05], np.float32)[None, None, :]
+    dens = np.ones((H, W, 1), np.float32)
+    if snow_mm > 80:                                                        # snow on the upper side of limbs
+        top = np.clip(-np.gradient(cv2.GaussianBlur(lum, (0, 0), 0.8), axis=0) / 8, 0, 1) * (dens[..., 0] > 0.3)
+        snow_c = np.full((1, 1, 3), float(np.mean(sky_rgb)) * 1.05, np.float32)
+        crown = crown * (1 - 0.3 * top[..., None]) + snow_c * 0.3 * top[..., None]
+    out = out * (1 - w[..., None]) + crown * w[..., None]
     return out, float(veg.mean())
 
 
@@ -846,7 +852,7 @@ def paint_heightfield(col, alpha, D_mm, mask, s_px_per_m, face_rgb, rng):
     at the eave, the walls of cleared strips and paths, rims of melt holes, an overhang that hangs over
     the gutter. Returns colour, alpha, depth and a face mask in photo space."""
     H, W = D_mm.shape
-    raw = (np.where(mask, D_mm, 0) / 1000.0 * s_px_per_m).astype(np.float32)
+    raw = (np.where(mask, D_mm, 0) / 1000.0 * np.asarray(s_px_per_m, np.float32)).astype(np.float32)
     mk = mask.astype(np.float32)
     L = cv2.GaussianBlur(raw, (0, 0), 3.0) / np.maximum(cv2.GaussianBlur(mk, (0, 0), 3.0), 1e-3) * mk   # smooth inside only
     out_c = np.zeros_like(col)
@@ -874,7 +880,8 @@ def paint_heightfield(col, alpha, D_mm, mask, s_px_per_m, face_rgb, rng):
             top = li[sel] == k
             # face: vertical wall of the layer, darker toward its foot (less sky), slightly blue
             f = (k / np.maximum(li[sel], 1)).astype(np.float32)
-            fcol = fr[None, :] * (0.80 + 0.12 * f)[:, None]
+            fbase = fr[ys, x] if fr.ndim == 3 else fr[None, :]
+            fcol = fbase * (0.80 + 0.12 * f)[:, None]
             c = np.where(top[:, None], col[ys, x], fcol)
             a = np.where(top, alpha[ys, x], np.where(thick[sel], 1.0, alpha[ys, x]))
             out_c[y, x] = c
@@ -1172,7 +1179,7 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
         sky_rgb = np.median(img[skyp].reshape(-1, 3), 0) if np.sum(skyp) > 500 else np.array(host.airlight)
         veg = normals.vegetation(img, scene.normal if scene is not None else None) & ~on_slope & (ov.mask == 0)
         bg, graded = winter_grade(bg, rng, veg, sky_rgb, weather["ground_mm"])
-        if weather["ground_mm"] > 50 and rng.random() < 0.45 and veg.any():      # snow-laden / hoarfrost crowns
+        if False:      # snow-laden crowns: clump-based version read as camouflage; twig flecks in winter_grade instead
             vc = ndi.binary_fill_holes(cv2.morphologyEx(veg.astype(np.uint8), cv2.MORPH_CLOSE,
                                                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))) > 0)
             bg = snowy_crowns(bg, vc, rng, snow * 0.95, rng.uniform(0.45, 0.8))
@@ -1228,13 +1235,26 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
         under = np.clip(cv2.GaussianBlur(g0, (0, 0), 2.5) / (cv2.GaussianBlur(g0, (0, 0), 20) + 1), 0.8, 1.1)
         r = aer["r"]
         tex_m = metric_texture(r, rng, geo.px_per_m_photo)
-        sky = (0.62 + 0.38 * cos_t) * tex_m * (1 + 0.6 * (under - 1))           # shadows and edges stay
+        ppm_w = np.minimum(geo.px_per_m_photo / np.clip(r, 0.3, 50), 1.3 * geo.px_per_m_photo).astype(np.float32)
+        # rounded snow body: brightness falls off toward the front (lower) edge of each snow patch, where
+        # the surface turns away from the sky, and slightly at the top edge (concave join with a wall)
+        mw = neigh.astype(np.float32)
+        rad = np.clip(Dn / 1000.0 * ppm_w * 1.5, 1.0, 6.0)
+        ms = cv2.GaussianBlur(mw, (0, 0), 3.0)
+        gy = np.gradient(ms, axis=0)
+        round_sh = 1 - 0.9 * np.clip(-gy, 0, None) * rad - 0.3 * np.clip(gy, 0, None) * rad
+        sky = (0.62 + 0.38 * cos_t) * (1 + 0.3 * (tex_m - 1)) * (1 + 0.35 * (under - 1)) * np.clip(round_sh, 0.7, 1)
         col_near = snow_hz * sky[..., None]
         col_w = col_near if aer["V"] is None else aer["V"] + aer["c"][..., None] * (col_near - aer["V1"])
         # distant surfaces are already softer in the photo (lens, haze, resampling): soften snow likewise
         wb = np.clip(np.log2(np.clip(r, 1, None)) / 3, 0, 1)[..., None]
         col_w = col_w * (1 - wb) + cv2.GaussianBlur(col_w, (0, 0), 1.2) * wb
         a_n = a_n * (1 - wb[..., 0]) + cv2.GaussianBlur(a_n, (0, 0), 1.0) * wb[..., 0]
+        # thickness: lift the snow by its height (per-pixel metres-to-pixels) so fronts show a face
+        face_w = col_w * np.array([0.84, 0.82, 0.80], np.float32)[None, None, :]
+        col_w, a_n, Dn_l, face_n = paint_heightfield(col_w, a_n, Dn, neigh & (a_n > 0.02), ppm_w, face_w, rng)
+        Dn = np.maximum(Dn, Dn_l)
+        neigh = neigh | (a_n > 0.3)
         col = np.where((a_n > alpha)[..., None], col_w, col)
     alpha = np.maximum(alpha, a_n)
     capm = (cap_struct | cap_rail).astype(np.float32)
