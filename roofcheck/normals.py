@@ -144,3 +144,68 @@ def vegetation(img_bgr: np.ndarray, normal: np.ndarray | None = None) -> np.ndar
     n, lab, st, _ = cv2.connectedComponentsWithStats(v)
     v = np.isin(lab, 1 + np.flatnonzero(st[1:, cv2.CC_STAT_AREA] >= 600))      # crowns, not window frames
     return cv2.dilate(v.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+
+
+def point_normals(depth: np.ndarray, K: np.ndarray, smooth_px: float = 1.5) -> np.ndarray:
+    """Normals from the 3D point map (cross product of its image gradients). Unlike the network's normal
+    head they are not smoothed across object boundaries, so a facade stays a wall right up to the roof
+    edge."""
+    H, W = depth.shape
+    d = cv2.GaussianBlur(depth.astype(np.float32), (0, 0), smooth_px)
+    ys, xs = np.mgrid[0:H, 0:W].astype(np.float32)
+    Ki = np.linalg.inv(K)
+    X = (Ki[0, 0] * xs + Ki[0, 2]) * d
+    Y = (Ki[1, 1] * ys + Ki[1, 2]) * d
+    P = np.dstack([X, Y, d])
+    du = np.gradient(P, axis=1)
+    dv = np.gradient(P, axis=0)
+    n = np.cross(du, dv)
+    n /= np.linalg.norm(n, axis=2, keepdims=True) + 1e-9
+    flip = (n * P).sum(2) > 0                     # face the camera
+    n[flip] *= -1
+    return n.astype(np.float32)
+
+
+def roofness(img_bgr: np.ndarray, geo: Geometry, n_segments: int = 5000, min_frac: float = 0.75):
+    """Mask of surfaces snow can lie on (roofs, ledges, ground), conservative:
+    - both the network normal and the point-map normal say the surface faces up (tilt < 55 deg);
+    - snapped to SLIC superpixels: a segment is kept only if >= min_frac of it agrees and its normals are
+      consistent (a planar patch), so tree crowns and facade tops with mixed normals drop out;
+    - vegetation and sky removed. Returns (mask, mu per pixel)."""
+    from skimage.segmentation import slic
+    H, W = img_bgr.shape[:2]
+    if geo.K is None:
+        up_ok = (geo.mu > 0.3) & geo.valid
+        pn_tilt = None
+    else:
+        pn = point_normals(geo.depth, geo.K)
+        pn_tilt = np.degrees(np.arccos(np.clip(pn @ geo.up, -1, 1)))
+        up_ok = (np.nan_to_num(geo.tilt_deg, nan=90) < 55) & (pn_tilt < 55) & geo.valid
+    veg = vegetation(img_bgr, geo.normal)
+    up_ok &= ~veg
+    s = 1024 / max(H, W)
+    small = cv2.resize(img_bgr, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    seg = slic(small[:, :, ::-1], n_segments=n_segments, compactness=10, start_label=0, channel_axis=-1)
+    seg = cv2.resize(seg.astype(np.int32), (W, H), interpolation=cv2.INTER_NEAREST)
+    n = seg.max() + 1
+    cnt = np.bincount(seg.ravel(), minlength=n) + 1e-6
+    frac = np.bincount(seg.ravel(), up_ok.ravel().astype(np.float64), minlength=n) / cnt
+    nm = np.stack([np.bincount(seg.ravel(), geo.normal[..., k].ravel().astype(np.float64), minlength=n) / cnt
+                   for k in range(3)], 1)
+    consistency = np.linalg.norm(nm, axis=1)             # 1 = all normals equal, low = rough (crowns)
+    vegf = np.bincount(seg.ravel(), veg.ravel().astype(np.float64), minlength=n) / cnt
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    h, sat = hsv[..., 0].astype(np.int16), hsv[..., 1]
+    leafc = (((h >= 15) & (h < 80)) | (h > 170) | (h < 8)) & (sat > 55)
+    g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    mu_ = cv2.blur(g, (7, 7)); sd = np.sqrt(np.clip(cv2.blur(g * g, (7, 7)) - mu_ * mu_, 0, None))
+    leaf_f = np.bincount(seg.ravel(), leafc.ravel().astype(np.float64), minlength=n) / cnt
+    busy = np.bincount(seg.ravel(), sd.ravel().astype(np.float64), minlength=n) / cnt
+    treeish = (leaf_f > 0.3) & (busy > 9)
+    # a crown is a cluster of such segments: grow the decision to neighbouring leafy segments
+    tm = cv2.dilate(treeish[seg].astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+    near_tree = np.bincount(seg.ravel(), tm.ravel().astype(np.float64), minlength=n) / cnt
+    keep = (frac >= min_frac) & (consistency > 0.9) & (vegf < 0.2) & ~treeish & ~((near_tree > 0.5) & (leaf_f > 0.15))
+    m = keep[seg] & geo.valid & ~veg
+    mu = mu_from_tilt(np.nan_to_num(geo.tilt_deg, nan=90.0))
+    return m, mu

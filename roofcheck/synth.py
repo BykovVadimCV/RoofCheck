@@ -672,12 +672,15 @@ def world_snow(scene: "normals.Geometry", img, exclude, weather, state, rng, r=N
     in a thaw the whole town melts patchily, not just the target roof."""
     H, W = img.shape[:2]
     veg = normals.vegetation(img, scene.normal)
-    up = (scene.mu > 0.3) & scene.valid & ~veg
-    m, mu_seg = snap_to_segments(img, up.astype(np.float32), scene.valid)
+    m, mu_px = normals.roofness(img, scene)
+    mu_seg = cv2.GaussianBlur(mu_px, (0, 0), 3)
     m = cv2.GaussianBlur(m.astype(np.float32), (0, 0), 1.5) > 0.5          # no superpixel staircase
     # thin upward ledges (sills, cornices, balcony rails) are lost in superpixels: add them per pixel
-    upm = (scene.mu > 0.6) & scene.valid
-    ledge = upm & ~ndi.binary_opening(upm, np.ones((7, 7))) & (ndi.binary_opening(upm, np.ones((1, 9))))
+    upm = (scene.mu > 0.6) & scene.valid & ~veg
+    if scene.K is not None:                                              # ledges must be level in 3D too
+        pn = normals.point_normals(scene.depth, scene.K, 1.0)
+        upm &= np.degrees(np.arccos(np.clip(pn @ scene.up, -1, 1))) < 45
+    ledge = upm & ~ndi.binary_opening(upm, np.ones((7, 7))) & (ndi.binary_opening(upm, np.ones((1, 15))))
     m |= ledge
     mu_seg = np.where(ledge, scene.mu, mu_seg)
     m &= ~exclude & ~veg
@@ -1083,7 +1086,7 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
         if fr is not None:
             padx = lambda a, v=0: np.vstack([a, np.full((ext, Wg), v, a.dtype)]) if ext else a
             lay_x = {"seams": padx(layers["seams"], False), "structure": padx(layers["structure"], False)}
-            relief = snow_surface(D, lay_x, rng)
+            relief = snow3d.smooth_relief(D, lay_x["seams"], freshness, rng, PX_PER_M)
             struct_x = lay_x["structure"]
             H_m, sinfo = snow3d.solid_height(D, padx(cut_g, False) if cut_g is not None else None, struct_x,
                                              freshness, rng, relief_mm=np.where(struct_x, 0, relief))
@@ -1144,7 +1147,7 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     Dn = np.zeros((H0, W0), np.float32)
     aer, w_info = None, {}
     if scene is not None:
-        excl = on_slope | (struct_ph > 0) | face | (ov.mask > 0) | below_eave & _near_quad(geo.quad, (H0, W0), 0.05)
+        excl = on_slope | (struct_ph > 0) | face | (ov.mask > 0) | _near_quad(geo.quad, (H0, W0), 0.04)
         neigh = np.zeros((H0, W0), bool)
         d_ref = float(np.median(scene.depth[on_slope])) if on_slope.any() else 0.0
         aer = aerial_profile(img, scene.depth, scene.valid, d_ref)

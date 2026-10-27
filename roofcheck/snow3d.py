@@ -100,6 +100,35 @@ def roof_frame(K, depth, valid, quad, M, Hg, Wg, length_m, up, normal=None, igno
 
 
 # ------------------------------------------------------------------ the snow solid
+def _fbm(shape, scale_px, octaves, rng):
+    H, W = shape
+    out = np.zeros(shape, np.float32); amp = 1.0; tot = 0.0
+    for o in range(octaves):
+        s = scale_px / 2 ** o
+        if s < 2:
+            break
+        g = rng.standard_normal((int(H / s) + 3, int(W / s) + 3)).astype(np.float32)
+        out += amp * cv2.resize(g, (W, H), interpolation=cv2.INTER_CUBIC)[:H, :W]
+        tot += amp; amp *= 0.5
+    out /= max(tot, 1e-6)
+    return (out - out.mean()) / (out.std() + 1e-6)
+
+
+def smooth_relief(D_mm, seams, freshness, rng, P=PX_PER_M):
+    """Top surface of the snow body, mm. Seen from tens of metres, a snow cover is smooth: the body follows
+    the depth field low-passed at ~0.3-0.5 m (wind and settling round everything off), plus broad, low
+    swells (1.5-5 m, a few mm to 2 cm high) and, only while the layer is thin, the seams printing through.
+    No centimetre-scale relief: lit at a grazing angle it reads as crumpled paper."""
+    body = ndi.gaussian_filter(D_mm, rng.uniform(0.3, 0.5) * P)
+    thin_mix = np.clip(D_mm / 40.0, 0, 1)                      # thin snow keeps its own shape (clearing marks)
+    base = D_mm * (1 - thin_mix) + body * thin_mix
+    swell = _fbm(D_mm.shape, rng.uniform(1.5, 5.0) * P, 2, rng)
+    amp = np.clip(body * {"fresh": 0.04, "settled": 0.03, "wet": 0.02}[freshness], 0, 20)
+    ridge = ndi.gaussian_filter(seams.astype(np.float32), 0.06 * P)
+    ridge = ridge / (ridge.max() + 1e-6) * 25.0 * np.exp(-body / 60.0) * (D_mm > 1)
+    return np.clip(base + swell * amp + ridge, 0, None).astype(np.float32)
+
+
 def solid_height(D_mm, cut, near_struct, freshness, rng, relief_mm=None):
     """Height of the snow surface above the roof plane, metres, with rounded edges.
 
@@ -160,7 +189,7 @@ def shade3d(H_m, fr: RoofFrame, up, struct, rng, albedo=None, illum=None):
     el = np.radians(rng.uniform(25, 55))
     l = np.cos(el) * horiz + np.sin(el) * up
     direct = np.clip(nrm @ l, 0, None)
-    kd = rng.uniform(0.1, 0.3)
+    kd = rng.uniform(0.05, 0.18)
     E = (1 - kd) * sky * (0.35 + 0.65 * vis) + kd * direct
     flat = (1 - kd) * (1 + 2 * float(fr.n @ up)) / 3 * (0.35 + 0.65 * float(np.median(vis))) + kd * max(float(fr.n @ l), 0)
     S = E / max(flat, 1e-3)
