@@ -130,16 +130,26 @@ def smooth_relief(D_mm, seams, freshness, rng, P=PX_PER_M):
     return np.clip(base + swell * amp + ridge, 0, None).astype(np.float32)
 
 
-def solid_height(D_mm, cut, near_struct, freshness, rng, relief_mm=None, P=PX_PER_M):
+def solid_height(D_mm, cut, near_struct, freshness, rng, relief_mm=None, P=PX_PER_M, continues=()):
     """Height of the snow surface above the roof plane, metres, with rounded edges.
 
     The profile at a free edge is a quarter ellipse of radius R = k x local depth (k: fresh 1.2-2.0,
     settled 0.5-1.0, wet 0.2-0.45), i.e. fresh snow ends in a soft rounded nose, settled snow in a
     shallower one. At shovel cuts R is ~0.15 x depth (near-vertical wall with a softened top). Against
-    structures snow banks up (a fillet) instead of rounding away."""
+    structures snow banks up (a fillet) instead of rounding away. `continues`: grid sides where the snow
+    does not end (e.g. "top" for the ridge: the cover carries on over it to the other slope)."""
     k = {"fresh": rng.uniform(1.2, 2.0), "settled": rng.uniform(0.5, 1.0), "wet": rng.uniform(0.2, 0.45)}[freshness]
     snow = D_mm > 3
-    dist_m = ndi.distance_transform_edt(np.pad(snow, 1))[1:-1, 1:-1] / P
+    pad = np.pad(snow, 1)
+    if "top" in continues:
+        pad[0, :] = True
+    if "bottom" in continues:
+        pad[-1, :] = True
+    if "left" in continues:
+        pad[:, 0] = True
+    if "right" in continues:
+        pad[:, -1] = True
+    dist_m = ndi.distance_transform_edt(pad)[1:-1, 1:-1] / P
     Ds = ndi.gaussian_filter(D_mm, 0.08 * P)
     Dref = ndi.grey_dilation(Ds, size=int(0.3 * P) | 1)               # thickness of the body behind the edge
     R = np.maximum(k * Dref / 1000.0, 0.01)
@@ -150,15 +160,20 @@ def solid_height(D_mm, cut, near_struct, freshness, rng, relief_mm=None, P=PX_PE
     prof = np.sqrt(np.clip(1 - (1 - x) ** 2, 0, 1))
     base = (relief_mm if relief_mm is not None else D_mm) / 1000.0
     H = base * np.where(snow, prof, 1.0)
+    if "top" in continues:            # ridge: a lower, rounded crest where wind scours the snow
+        rows = np.arange(H.shape[0])[:, None] / P
+        w = rng.uniform(0.3, 0.7)
+        H = H * (rng.uniform(0.45, 0.7) + (1 - rng.uniform(0.45, 0.7)) * np.sqrt(np.clip(rows / w, 0, 1)))
     if near_struct is not None and near_struct.any():                  # bank against chimneys and walls
         ds = ndi.distance_transform_edt(~near_struct) / P
         bank = np.exp(-ds / rng.uniform(0.1, 0.25)) * rng.uniform(0.15, 0.45) * Dref / 1000.0
-        H = np.where(snow | (ds < 0.3), np.maximum(H, (Ds / 1000.0) + bank * (Ds > 20)), H)
+        near = (ds < 0.6) & snow                      # only around structures, on top of the smooth body
+        H = np.where(near, np.maximum(H, base + bank * (Ds > 20)), H)
         H = np.where(near_struct, 0, H)
     return np.clip(H, 0, None).astype(np.float32), {"freshness": freshness, "round_k": round(float(k), 2)}
 
 
-def _horizon(h_m, px_m, dirs=8, steps=(2, 4, 8, 16, 32, 56)):
+def _horizon(h_m, px_m, dirs=12, steps=(1, 2, 3, 4, 6, 8, 11, 15, 20, 27, 36, 48, 64)):
     H, W = h_m.shape
     pad = max(steps) + 1
     hp = np.pad(h_m, pad, mode="edge")
@@ -171,7 +186,7 @@ def _horizon(h_m, px_m, dirs=8, steps=(2, 4, 8, 16, 32, 56)):
             sh = hp[pad + sy:pad + sy + H, pad + sx:pad + sx + W]
             mx = np.maximum(mx, (sh - h_m) / (np.hypot(sx, sy) * px_m + 1e-6))
         vis += 1 - np.sin(np.arctan(np.clip(mx, 0, None)))
-    return vis / dirs
+    return cv2.GaussianBlur((vis / dirs).astype(np.float32), (0, 0), 2.0)      # no step-ghosts of tall objects
 
 
 def shade3d(H_m, fr: RoofFrame, up, struct, rng, albedo=None, illum=None):

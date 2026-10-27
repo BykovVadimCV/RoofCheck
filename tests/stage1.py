@@ -52,6 +52,12 @@ ref = Reference(
               Polygon("slope", quad.tolist(), "карниз-лево, карниз-право, конёк-право, конёк-лево; боковые стороны по фальцам"),
               Polygon("exclude", own_roof, "кровля, с которой ведётся съёмка")],
     source="customer red polygon (auto-extracted) + manual exclude", season="autumn")
+# keep hand-drawn roles this script does not produce (structures, other roofs): they cannot be regenerated
+if (vdir / "reference.json").exists():
+    old = Reference.load(vdir / "reference.json")
+    own = {"roof", "slope", "exclude"}
+    ref.polygons += [p for p in old.polygons if p.role not in own]
+    ref.geometry = getattr(old, "geometry", {}) or {}
 ref.save(vdir)
 ObjectInfo("demo_roof_01", address="(уточнить у заказчика)", vantages=["v1"]).save(obj_dir)
 cvat.write_label_spec(OUT / "cvat_labels.json")

@@ -179,15 +179,30 @@ def surface_layers(rect: np.ndarray, valid: np.ndarray, known: np.ndarray, struc
             continue
         hh, ww = sl[0].stop - sl[0].start, sl[1].stop - sl[1].start
         area = (lbl[sl] == i).sum()
-        on_border = sl[0].start == 0 or sl[1].start == 0 or sl[1].stop == W
-        if on_border:
+        on_border = sl[0].start <= 3 or sl[1].start <= 3 or sl[1].stop >= W - 3
+        elongated = ww > 0.25 * W or (ww > 6 * max(hh, 1) and hh < 0.3 * PX_PER_M)    # strips, not objects
+        if on_border or elongated:
             outside.append(i)               # beyond the ridge or the gable: background, not a structure
         elif area > 0.05 * PX_PER_M ** 2 and not (ww < 0.25 * PX_PER_M and hh > 0.6 * PX_PER_M):
             keep.append(i)
     outside = np.isin(lbl, outside)
     struct = np.isin(lbl, keep)
-    if struct_known is not None:                # structures outlined once per vantage (reference role 'structure')
-        struct |= struct_known > 0
+    if struct_known is not None and struct_known.any():   # outlined once per vantage (role 'structure')
+        # outlines are loose boxes: inside each keep only what looks like the object (colour or brightness
+        # off the roof metal, or busy texture), filled per outline; the metal around it gets snow
+        gk = cv2.cvtColor(rect, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        mu_ = cv2.blur(gk, (5, 5)); sd = np.sqrt(np.clip(cv2.blur(gk * gk, (5, 5)) - mu_ * mu_, 0, None))
+        objlike = (dab > 7) | (np.abs(dL) > 14) | (sd > 10)
+        lk, nk = ndi.label(struct_known > 0)
+        for i, slc in enumerate(ndi.find_objects(lk), start=1):
+            if slc is None:
+                continue
+            box = lk[slc] == i
+            o = ndi.binary_closing(objlike[slc] & box, np.ones((5, 5)))
+            o = ndi.binary_fill_holes(ndi.binary_opening(o, np.ones((3, 3))))
+            if o.sum() < 0.15 * box.sum():          # object not separable from the metal: keep the outline
+                o = box
+            struct[slc] |= o & box
 
     g = cv2.cvtColor(rect, cv2.COLOR_BGR2GRAY)
     bh = cv2.morphologyEx(g, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
@@ -202,6 +217,11 @@ def surface_layers(rect: np.ndarray, valid: np.ndarray, known: np.ndarray, struc
     surf = ndi.binary_closing(metal | fence | seams | ((known == 0) & (valid > 0)), np.ones((int(0.3 * PX_PER_M),) * 2),
                              border_value=1)
     surf = ndi.binary_fill_holes(surf | struct) & (valid > 0) & ~outside
+    # the border-preserving closing keeps the outermost rows/columns; next to a non-roof area (facade,
+    # background past the ridge or gable) that leaves a 1-2 px sliver along the outline: drop it
+    surf &= ~ndi.binary_dilation(outside, np.ones((3, 3)), iterations=3)
+    thin = surf & ~ndi.binary_opening(surf, np.ones((5, 5)), border_value=1)
+    surf &= ~thin
     lbl, n = ndi.label(surf)
     if n:
         sizes = ndi.sum(surf, lbl, range(1, n + 1))
@@ -1107,7 +1127,8 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
             relief = snow3d.smooth_relief(D, lay_x["seams"], freshness, rng, PX_PER_M)
             struct_x = lay_x["structure"]
             H_m, sinfo = snow3d.solid_height(D, padx(cut_g, False) if cut_g is not None else None, struct_x,
-                                             freshness, rng, relief_mm=np.where(struct_x, 0, relief))
+                                             freshness, rng, relief_mm=np.where(struct_x, 0, relief),
+                                             continues=("top",))
             # the eave nose and the overhang are smooth along the eave (no per-column teeth)
             r0 = max(Hg - int(0.4 * PX_PER_M), 0)
             band = H_m[r0:].copy()
@@ -1116,8 +1137,14 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
             band = np.where(band > 0, sm / np.maximum(wgt, 1e-3), 0)
             ramp = np.clip((np.arange(H_m.shape[0] - r0) / (0.15 * PX_PER_M)), 0, 1)[:, None]
             H_m[r0:] = H_m[r0:] * (1 - ramp) + band * ramp
+            # what is physically there: the rounded solid, not the pre-rounding depth (labels, opacity and
+            # the flat fallback all follow it, so no full-opacity rim is left where the body rounds away)
+            D = np.where(struct_x, D, np.minimum(D, H_m * 1000.0)).astype(np.float32)
+            sc_ = np.clip(D - SEAM_HEIGHT_MM * (1 - np.exp(-D / 120.0)), 0, None)
+            alpha_g = opacity(np.where(lay_x["seams"], sc_, D), beta)
+            # lighting from the geometry only: opaque snow does not carry the metal's own light/dark pattern
             S3, nrm3 = snow3d.shade3d(H_m, fr, scene.up, struct_x.astype(np.float32), rng,
-                                      albedo=padx(alb_g, 1.0), illum=padx(layers["illum"], 1.0))
+                                      albedo=padx(alb_g, 1.0), illum=None)
             steep = np.clip((1 - nrm3 @ fr.n) * 4, 0, 1).astype(np.float32)      # 0 flat .. 1 wall
             S_smooth = cv2.GaussianBlur(S3, (0, 0), 3)
             bbox = snow3d.render_bbox(fr, geo.quad, H_m, (H0, W0))
@@ -1139,7 +1166,7 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     Dp = to_photo(D)
     Ip = to_photo(ice_g)
     sv_p = to_photo(np.vstack([sv_g, np.ones((ext, Wg))]) if ext else sv_g) > 0.5
-    struct_p = (to_photo(layers["structure"], cv2.INTER_LINEAR) > 0.5) | (struct_ph > 0)
+    struct_p = to_photo(layers["structure"], cv2.INTER_LINEAR) > 0.5
     fence_p = to_photo(layers["fence"], cv2.INTER_LINEAR) > 0.3
     below_eave = _below_line(geo.quad[0], geo.quad[1], (H0, W0))
     lip_p = (to_photo(np.vstack([np.zeros((Hg, Wg)), np.ones((ext, Wg))]) if ext else np.zeros((Hx, Wg)),
@@ -1155,7 +1182,7 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     D_eave = D[Hg - int(0.3 * PX_PER_M):Hg].max(0) if not null else np.zeros(Wg, np.float32)
     face_D = np.zeros((H0, W0), np.float32)                      # faces now come from the painter below
     face = np.zeros((H0, W0), bool)
-    cap_struct = caps(struct_ph > 0 if structures else struct_p, min(base_mm, 400) / 1000 * scale * rng.uniform(0.5, 0.9), rng=rng) if base_mm > 20 and not null \
+    cap_struct = caps(struct_p, min(base_mm, 400) / 1000 * scale * rng.uniform(0.5, 0.9), rng=rng) if base_mm > 20 and not null \
         else np.zeros((H0, W0), bool)
     cap_rail = caps(fence_p, min(base_mm, 60) / 1000 * scale, rails_only=True) if base_mm > 20 and not null \
         else np.zeros((H0, W0), bool)
