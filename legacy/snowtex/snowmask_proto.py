@@ -175,12 +175,13 @@ def sample(lay, target_cov, rng, scenario=None, tries=20):
         mat[~surf] = BARE
 
         # coverage targeting: thin snow (low depth) melts first -> bisection on threshold
+        rim_random = rng.random(mat.shape)  # freeze the field before threshold search
         def apply_melt(tm):
             mm = mat.copy()
             melt = (depth < tm) & np.isin(mm, (FRESH, PACKED))
             mm[melt] = BARE
             edge = ndi.binary_dilation(melt, iterations=m(0.35)) & np.isin(mm, (FRESH, PACKED))
-            mm[edge & (rng.random(mm.shape) < 0.6)] = SLUSH          # wet slushy rim
+            mm[edge & (rim_random < 0.6)] = SLUSH          # wet slushy rim
             return mm
         cov = lambda mm: np.isin(mm, COUNTED)[surf].mean()
         if cov(mat) < target_cov:                     # not enough snow in this scenario

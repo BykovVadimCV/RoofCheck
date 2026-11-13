@@ -1,0 +1,2 @@
+id,group_id,image,reference,split,source,license,snow_free_reviewed
+example_01,building_01,path/to/snow_free.jpg,path/to/reference.json,train,source_page_or_internal_id,license_or_permission,yes

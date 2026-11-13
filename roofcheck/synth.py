@@ -50,17 +50,23 @@ TEXTURE_DIRS = ["/mnt/user-data/uploads/snow-survey/textures/cc0", "data/texture
 _TEX = None
 
 
+def texture_paths(dirs):
+    """The exact exemplar files consumed by the legacy renderer, in stable order."""
+    import glob
+    files = []
+    for d in dirs:
+        files += glob.glob(f"{d}/polyhaven/snow_*/*_color_2k.jpg")
+        files += glob.glob(f"{d}/polyhaven/asphalt_snow/*_color_2k.jpg")
+        files += glob.glob(f"{d}/ambientcg/Snow*/*_color_2k.jpg")
+    return sorted(set(files))
+
+
 def texture_bank() -> list[np.ndarray]:
     """High-pass luminance detail of the CC0 snow scans (Poly Haven snow_*, ambientCG Snow*), unit std."""
     global _TEX
     if _TEX is None:
-        import glob
-        files = []
-        for d in TEXTURE_DIRS:
-            files += glob.glob(f"{d}/polyhaven/snow_*/*_color_2k.jpg") + glob.glob(f"{d}/polyhaven/asphalt_snow/*_color_2k.jpg")
-            files += glob.glob(f"{d}/ambientcg/Snow*/*_color_2k.jpg")
         _TEX = []
-        for f in sorted(set(files)):
+        for f in texture_paths(TEXTURE_DIRS):
             g = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
             if g is None:
                 continue
@@ -70,8 +76,8 @@ def texture_bank() -> list[np.ndarray]:
     return _TEX
 
 
-def exemplar(shape, rng, tile_px) -> np.ndarray:
-    bank = texture_bank()
+def exemplar(shape, rng, tile_px, use_bank=True) -> np.ndarray:
+    bank = texture_bank() if use_bank else []
     H, W = shape
     if not bank:
         return fbm(shape, tile_px / 8, 4, rng)
@@ -259,7 +265,7 @@ def triangular_drift(dist_m, length_m, peak_mm):
     return np.clip(1 - dist_m / max(length_m, 1e-3), 0, 1) * peak_mm
 
 
-def accumulate(Hg, Wg, layers, weather, pitch_deg, rng) -> tuple[np.ndarray, dict]:
+def accumulate(Hg, Wg, layers, weather, pitch_deg, rng, fence_drift=True) -> tuple[np.ndarray, dict]:
     """Balanced load x unbalance between slopes + fence and obstruction drifts, mass-conserving."""
     P = PX_PER_M
     surf, struct = layers["surface"], layers["structure"]
@@ -279,6 +285,8 @@ def accumulate(Hg, Wg, layers, weather, pitch_deg, rng) -> tuple[np.ndarray, dic
     l_f = rng.uniform(0.6, 1.5)
     k_f = rng.uniform(0.2, 0.7)
     drift = triangular_drift(up_m, l_f, k_f * base) * np.ones((1, Wg), np.float32)
+    if not fence_drift:
+        drift[:] = 0
 
     # obstruction drifts on the lee side along the eave direction (wind_u), length 2h, mu_total <= 2.4
     lbl, n = ndi.label(struct)
@@ -307,7 +315,7 @@ def accumulate(Hg, Wg, layers, weather, pitch_deg, rng) -> tuple[np.ndarray, dic
     if src.sum() > 0 and V > 0:
         frac = min(V / src.sum(), 0.6)
         D = D - src * frac + drift * (frac * src.sum() / V)
-    info.update({"fence_drift_m": round(l_f, 2), "obstruction_drifts": n_obs,
+    info.update({"fence_drift_m": round(l_f, 2) if fence_drift else 0.0, "obstruction_drifts": n_obs,
                  "mass_ratio": round(float(D.sum()) / max(total0, 1e-6), 3)})
     return np.clip(D, 0, None).astype(np.float32), info
 
@@ -397,7 +405,24 @@ def target_melt(D, vis, tau, target, noise, iters=30):
     return np.clip(D - 0.5 * (lo + hi) * f, 0, None).astype(np.float32)
 
 
-def apply_state(D, state, layers, weather, vis, rng, tau):
+def soft_front_mask(shape, rng):
+    """A cleared eave area with a broad irregular front in slope coordinates.
+
+    Heuristic, not a physical reconstruction of a specific clearing operation.
+    """
+    H, W = shape
+    xnoise = rng.standard_normal(W).astype(np.float32)
+    coarse = ndi.gaussian_filter1d(xnoise, max(1.0, W * 0.10), mode="reflect")
+    fine = ndi.gaussian_filter1d(xnoise, max(1.0, W * 0.025), mode="reflect")
+    coarse = (coarse - coarse.mean()) / (coarse.std() + 1e-6)
+    fine = (fine - fine.mean()) / (fine.std() + 1e-6)
+    center = rng.uniform(0.38, 0.70) * H
+    height = center + rng.uniform(0.05, 0.11) * H * np.clip(0.8 * coarse + 0.2 * fine, -2.5, 2.5)
+    height = np.clip(height, 0.18 * H, 0.86 * H)
+    return np.arange(H)[:, None] >= height[None, :]
+
+
+def apply_state(D, state, layers, weather, vis, rng, tau, partial_style="legacy"):
     P = PX_PER_M
     Hg, Wg = D.shape
     struct = layers["structure"]
@@ -406,7 +431,9 @@ def apply_state(D, state, layers, weather, vis, rng, tau):
     info = {}
     wet_clear = state in ("cleared", "partially_cleared") and rng.random() < 0.3      # cleared in a thaw
     if state == "partially_cleared":
-        how = rng.choice(["strips", "eave_band"])
+        if partial_style not in ("legacy", "soft_front"):
+            raise ValueError("partial_style must be 'legacy' or 'soft_front'")
+        how = "soft_front" if partial_style == "soft_front" else rng.choice(["strips", "eave_band"])
         if how == "strips":
             m = np.zeros((Hg, Wg), bool)
             x = rng.uniform(0, 2) * P
@@ -416,13 +443,24 @@ def apply_state(D, state, layers, weather, vis, rng, tau):
                     m[:, int(x):int(x + w)] = True
                 x += w + rng.uniform(0.3, 2.5) * P
             m &= np.arange(Hg)[:, None] > rng.uniform(0, 0.5) * Hg
-        else:
+        elif how == "eave_band":
             m = (np.arange(Hg)[:, None] > Hg - rng.uniform(0.8, 2.2) * P) & np.ones((1, Wg), bool)
-        m = warp_mask(m, rng, 0.2 * P, 2 * P)
+        else:
+            m = soft_front_mask((Hg, Wg), rng)
+        if how != "soft_front":
+            m = warp_mask(m, rng, 0.2 * P, 2 * P)
         R, a = cleared_residue(Hg, Wg, layers, rng, wet=wet_clear)
         info["_cut"] = m
-        D = np.where(m, R, D)
-        alb = np.where(m, a, 1.0)
+        if how == "soft_front":
+            # Do not reproduce every panel-shaped scrape in the cleared band.
+            # Keep only sparse thicker remnants; this is a visual heuristic.
+            R = np.where(R > 12, np.minimum(R * 0.3, 20), 0).astype(np.float32)
+            mix = soft_mask(m, 0.10 * P)
+            D = (1 - mix) * D + mix * R
+            alb = (1 - mix) + mix * a
+        else:
+            D = np.where(m, R, D)
+            alb = np.where(m, a, 1.0)
         if wet_clear:
             wet = np.where(m, rng.uniform(0.6, 1.0), 0)
         info["clearing"] = how
@@ -452,17 +490,19 @@ def apply_state(D, state, layers, weather, vis, rng, tau):
     return D.astype(np.float32), wet.astype(np.float32), alb.astype(np.float32), info
 
 
-def roughen(D, layers, state, rng):
+def roughen(D, layers, state, rng, use_bank=True, cleaned_area=None):
     """cm-scale unevenness and crumbly edges (thin snow breaks up, deep snow barely changes),
     snow kept in the grooves along the seams after clearing or melt."""
     P = PX_PER_M
     Hg, Wg = D.shape
-    ex = exemplar((Hg, Wg), rng, rng.uniform(3, 8) * P)
+    ex = exemplar((Hg, Wg), rng, rng.uniform(3, 8) * P, use_bank=use_bank)
     rough = 0.6 * fbm((Hg, Wg), 0.15 * P, 3, rng) + 0.4 * ex
     D = D + np.clip(D, 0, 30) * rng.uniform(0.25, 0.5) * rough + np.clip(D, 0, 400) * 0.03 * ex
     if state in ("cleared", "partially_cleared", "thaw"):
         groove = ndi.binary_dilation(layers["seams"], np.ones((1, 3))) ^ layers["seams"]
         groove = ndi.gaussian_filter(groove.astype(np.float32), 0.6) * (fbm((Hg, Wg), 0.4 * P, 2, rng) > -0.3)
+        if cleaned_area is not None:
+            groove = groove * ~cleaned_area
         D = D + groove * rng.uniform(2, 10)
     D = np.clip(D, 0, None) * layers["surface"] * ~layers["structure"]
     return D.astype(np.float32)
@@ -495,13 +535,13 @@ def snow_radiance(img, p: hostmatch.HostParams, metal_bgr, rng) -> tuple[np.ndar
 SHADING = "surface"          # "surface": light the snow height field; "flat": v3 overlay shading (for comparison)
 
 
-def shade_field_flat(D, layers, rng):
+def shade_field_flat(D, layers, rng, use_bank=True):
     P = PX_PER_M
     Dm = ndi.gaussian_filter(D, 0.08 * P) / 1000.0
     gy, gx = np.gradient(Dm * P)
     shade = 1 - 0.10 * np.clip(gy * 3, -1, 1) - 0.05 * np.clip(gx * rng.uniform(-3, 3), -1, 1)
     ao = np.clip((Dm - ndi.gaussian_filter(Dm, 0.5 * P)) * 6, -0.08, 0.03)
-    tex = exemplar(D.shape, rng, rng.uniform(2.5, 7) * P)
+    tex = exemplar(D.shape, rng, rng.uniform(2.5, 7) * P, use_bank=use_bank)
     grain = rng.uniform(0.015, 0.045) * tex + 0.008 * fbm(D.shape, 0.05 * P, 2, rng)
     if rng.random() < 0.35:
         specks = (fbm(D.shape, 0.06 * P, 2, rng) > rng.uniform(2.6, 3.2)).astype(np.float32)
@@ -587,11 +627,28 @@ def shade_surface(D, layers, pitch_deg, rng):
     return np.clip(s, 0.45, 1.15).astype(np.float32)
 
 
-def shade_field(D, layers, rng, pitch_deg=25.0):
+def shade_field(D, layers, rng, pitch_deg=25.0, use_bank=True):
     srng = np.random.default_rng(int(rng.integers(1 << 31)))   # same draws from rng in both modes
     if SHADING == "flat":
-        return shade_field_flat(D, layers, srng)
+        return shade_field_flat(D, layers, srng, use_bank=use_bank)
     return shade_surface(D, layers, pitch_deg, srng)
+
+
+def smooth_snow_shading(shade, support, detail, normalize_support=False):
+    """Smooth fine shading while retaining a reduced broad lighting gradient."""
+    if detail >= 1:
+        return shade
+    extreme = max(0.0, (0.2 - detail) / 0.2)
+    sigma = 1.4 + 3.6 * extreme
+    if normalize_support:
+        weights = cv2.GaussianBlur(support.astype(np.float32), (0, 0), sigma)
+        smooth = cv2.GaussianBlur(shade * support, (0, 0), sigma) / np.maximum(weights, 1e-6)
+    else:
+        smooth = cv2.GaussianBlur(shade, (0, 0), sigma)
+    if extreme > 0 and support.any():
+        center = float(np.median(shade[support]))
+        smooth = center + (smooth - center) * (1 - 0.65 * extreme)
+    return smooth + detail * (shade - smooth)
 
 
 def photo_field_D(shape, mask, base_mm, rng, scale_px=80):
@@ -1048,9 +1105,31 @@ class Sample:
 def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, geom: dict,
                 host: hostmatch.HostParams | None = None, other_roofs: list | None = None, structures: list | None = None,
                 state: str | None = None, label_tau_mm: float = 2.0, null: bool = False,
-                scene: "normals.Geometry | None" = None) -> Sample:
+                scene: "normals.Geometry | None" = None, fence_mode: str = "auto", structure_mode: str = "auto",
+                texture_policy: str = "legacy", texture_seed: int | None = None,
+                apply_material: bool = False, texture_strength: float = 0.02, partial_style: str = "legacy",
+                snow_brightness: float = 1.0, snow_detail: float = 1.0,
+                ground_snow_mm: float | None = None) -> Sample:
     """scene: normals of the frame (normals.NormalEstimator.analyse); snow then lies on every upward-facing
     surface. Without it, only the other_roof polygons get snow. null=True runs the whole compositing chain with zero snow (shortcut test, see tests/validate.py)."""
+    if fence_mode not in ("auto", "none"):
+        raise ValueError("fence_mode must be 'auto' or 'none'")
+    if structure_mode not in ("auto", "manual"):
+        raise ValueError("structure_mode must be 'auto' or 'manual'")
+    if texture_policy not in ("legacy", "isolated"):
+        raise ValueError("texture_policy must be 'legacy' or 'isolated'")
+    if partial_style not in ("legacy", "soft_front"):
+        raise ValueError("partial_style must be 'legacy' or 'soft_front'")
+    if texture_policy == "isolated" and scene is not None:
+        raise ValueError("isolated texture mode currently supports planar scene=None only")
+    if not 0 <= texture_strength <= 0.25:
+        raise ValueError("texture_strength must be within 0..0.25")
+    if not 0.7 <= snow_brightness <= 1.4 or not 0 <= snow_detail <= 1:
+        raise ValueError("snow_brightness must be 0.7..1.4 and snow_detail 0..1")
+    if ground_snow_mm is not None and not 0 <= ground_snow_mm <= 1000:
+        raise ValueError("ground_snow_mm must be 0..1000")
+    if apply_material and (texture_policy != "isolated" or texture_seed is None or not texture_bank()):
+        raise ValueError("isolated material requires a texture seed and a nonempty texture bank")
     H0, W0 = img.shape[:2]
     ov = overlays.detect(img)
     if host is None:
@@ -1077,15 +1156,24 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
         cv2.fillPoly(struct_ph, [np.round(np.asarray(sp)).astype(np.int32)], 1)
     struct_known = cv2.warpPerspective(struct_ph, geo.M, (Wg, Hg), flags=cv2.INTER_NEAREST)
     layers = surface_layers(rect, valid, known, struct_known)
+    if structure_mode == "manual":
+        # Treat the explicitly marked outline as a conservative occluder.
+        # Missing structures will not be detected in this mode.
+        layers["structure"] = (struct_known > 0) & layers["surface"]
+    if fence_mode == "none":
+        layers["fence"] = np.zeros_like(layers["fence"], dtype=bool)
     vis = (known > 0) & (valid > 0) & ~layers["structure"] & layers["surface"]
 
     weather = sample_weather(rng)
+    if ground_snow_mm is not None:
+        weather["ground_mm"] = float(ground_snow_mm)
     state = state or str(rng.choice(STATES, p=STATE_P))
-    D, acc_info = accumulate(Hg, Wg, layers, weather, geom["pitch_deg"], rng)
-    D, wet, alb_g, st_info = apply_state(D, state, layers, weather, vis, rng, label_tau_mm)
+    D, acc_info = accumulate(Hg, Wg, layers, weather, geom["pitch_deg"], rng, fence_drift=fence_mode != "none")
+    D, wet, alb_g, st_info = apply_state(D, state, layers, weather, vis, rng, label_tau_mm, partial_style=partial_style)
     cut_g = st_info.pop("_cut", None)
     freshness = "wet" if (state == "thaw" or weather["wetness"] > 0.5) else ("fresh" if rng.random() < 0.5 else "settled")
-    D = roughen(D, layers, state, rng)
+    cleaned_area = cut_g if state == "partially_cleared" and partial_style == "soft_front" else None
+    D = roughen(D, layers, state, rng, use_bank=texture_policy == "legacy", cleaned_area=cleaned_area)
     ice_g = ice_grid(Hg, Wg, state, rng) * (D < 5)
     if null:
         D[:] = 0
@@ -1096,7 +1184,7 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     seam_cover = np.clip(D - SEAM_HEIGHT_MM * (1 - np.exp(-D / 120.0)), 0, None) if SHADING == "surface" \
         else np.clip(D - SEAM_HEIGHT_MM, 0, None)
     alpha_g = opacity(np.where(layers["seams"], seam_cover, D), beta)
-    shade_g = shade_field(D, layers, rng, geom["pitch_deg"]) * alb_g
+    shade_g = shade_field(D, layers, rng, geom["pitch_deg"], use_bank=texture_policy == "legacy") * alb_g
     sv_g = seams_visible(D, beta)
 
     # overhang beyond the eave: deep snow creeps over the eave and curls down; the deeper, the further
@@ -1238,10 +1326,27 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
             clip_info = "under_white_point"
         else:
             clip_info = "allowed_to_clip"
-    snow_hz = hostmatch.apply_haze(snow[None, None, :], host)                    # (1,1,3)
-    tex_p = 1 + 0.03 * fbm((H0, W0), 6, 3, rng)
+    snow_hz = hostmatch.apply_haze(snow[None, None, :], host) * snow_brightness   # (1,1,3)
+    tex_p = 1 + 0.03 * snow_detail * fbm((H0, W0), 6, 3, rng)
+    if snow_detail < 1:
+        S = smooth_snow_shading(S, on_slope & (A > 0.5), snow_detail)
+    # A thicker layer hides fine substrate detail; keep its broad lighting.
+    # Dp is the simulated depth, not a measured physical ground truth.
+    thick = np.clip((Dp - 10.0) / 100.0, 0, 1).astype(np.float32)
+    smooth_S = smooth_snow_shading(S, on_slope & (A > 0.5), 0.0)
+    S = S * (1 - 0.85 * thick) + smooth_S * (0.85 * thick)
+    tex_p = 1 + (tex_p - 1) * (1 - 0.85 * thick)
     alpha = A * on_slope
-    col = snow_hz * (S * tex_p)[..., None]
+    col = snow_hz * (S * tex_p * (1 + 0.02 * thick))[..., None]
+    if texture_policy == "isolated" and apply_material and not null:
+        # Separate stream and roof coordinates: material cannot change D, alpha,
+        # geometry or later draws from the simulation RNG. The high-pass bank is
+        # a luminance modulation, not a claim of calibrated snow reflectance.
+        material_rng = np.random.default_rng(texture_seed)
+        material_g = exemplar((Hx, Wg), material_rng, 4.0 * PX_PER_M)
+        material_p = to_photo(material_g)
+        factor = 1 + texture_strength * snow_detail * (1 - 0.85 * thick) * np.clip(material_p, -2.5, 2.5)
+        col = col * factor[..., None]
     # ice crust on the metal (where snow is thin): translucent, blue-grey, glossy streaks down the slope
     ia = np.clip(Ip / 10.0, 0, 0.8) * on_slope * (Dp < 5)
     if ia.any():
@@ -1255,7 +1360,10 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
     face_rgb = snow_hz.reshape(3) * np.array([1.04, 1.0, 0.96], np.float32)
     if R3 is not None:
         hit = R3["hit"]
-        col = np.where(hit[..., None], snow_hz * R3["S"][..., None], col)
+        s3 = R3["S"]
+        if snow_detail < 1:
+            s3 = smooth_snow_shading(s3, hit, snow_detail, normalize_support=True)
+        col = np.where(hit[..., None], snow_hz * s3[..., None], col)
         alpha = np.where(hit, R3["A"], alpha)
         d_t = np.where(hit, R3["D"], np.where(on_slope, Dp, 0))
         face = hit & ~on_slope
@@ -1363,7 +1471,7 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
         out, fall = snowfall(out, rng, host.airlight)
     if not null:
         out, wb = white_balance(out, float((ab > 0.5).mean()), rng)
-    out = hostmatch.finish(out, weight, host, rng)
+    out = hostmatch.finish(out, weight, host, rng, snow_detail=snow_detail, thick_snow=thick * (alpha > 0.5))
     out[ov.mask > 0] = img_f[ov.mask > 0]                         # the app stamps after processing
     ok, enc = cv2.imencode(".jpg", out.astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, int(host.jpeg_quality)])
     out = cv2.imdecode(enc, 1)
@@ -1409,7 +1517,7 @@ def make_sample(img: np.ndarray, quad: np.ndarray, roof_poly: np.ndarray, rng, g
             "bare_trees_frac": round(graded, 3), "tree_mode": tree_mode, "snowfall": round(float(fall), 3),
             "ice_px": int(ice_vis.sum()), "icicles": n_ici, "buried_structure_px": int(buried.sum()),
             "face_px": int(face.sum()), "overhang_m": round(ext / PX_PER_M, 2),
-            "seams_hidden_frac": round(float((~sv_g[:Hg])[vis].mean()), 3) if vis.any() else 0.0, "shading": SHADING, "exposure_mode": clip_info, "white_balance_shift": wb, "exposure": round(e, 3), "label_tau_mm": label_tau_mm, "null": null,
+            "seams_hidden_frac": round(float((~sv_g[:Hg])[vis].mean()), 3) if vis.any() else 0.0, "shading": SHADING, "fence_mode": fence_mode, "structure_mode": structure_mode, "partial_style": partial_style, "exposure_mode": clip_info, "white_balance_shift": wb, "exposure": round(e, 3), "label_tau_mm": label_tau_mm, "null": null,
             "host": host.as_dict()}
     return Sample(out, depth, cls, roi, cov, info, seams)
 
@@ -1418,7 +1526,8 @@ def labels_at(depth: np.ndarray, cls: np.ndarray, threshold_mm: float, band_mm: 
     """Binary snow target at a client threshold: 1 snow, 0 not, 255 ignore (overlays, structures' bodies
     and the +-band around the threshold, where a pixel is physically ambiguous)."""
     y = (depth >= threshold_mm).astype(np.uint8)
-    y[np.abs(depth - threshold_mm) <= band_mm] = 255
+    # A zero-depth pixel is certainly snow-free even when the uncertainty band touches zero.
+    y[(depth > 0) & (np.abs(depth - threshold_mm) <= band_mm)] = 255
     y[cls == CLS["ignore"]] = 255
     return y
 

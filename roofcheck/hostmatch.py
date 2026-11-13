@@ -200,11 +200,13 @@ def blur_layer(premult: np.ndarray, alpha: np.ndarray, p: HostParams):
     return cv2.GaussianBlur(premult, (0, 0), s), cv2.GaussianBlur(alpha, (0, 0), s)
 
 
-def finish(out: np.ndarray, weight: np.ndarray, p: HostParams, rng) -> np.ndarray:
+def finish(out: np.ndarray, weight: np.ndarray, p: HostParams, rng, snow_detail: float = 1.0, thick_snow=None) -> np.ndarray:
     """Sharpening halo and brightness-dependent noise where snow was added (weight 0..1), then clip."""
     w = weight[..., None]
     blur = cv2.GaussianBlur(out, (0, 0), p.usm_radius)
-    sharp = out + p.usm_amount * (out - blur)
+    extreme_smooth = max(0.0, (0.2 - snow_detail) / 0.2)
+    sharp_strength = (0.4 + 0.6 * snow_detail) * (1 - 0.75 * extreme_smooth)
+    sharp = out + p.usm_amount * sharp_strength * (out - blur)
     out = out * (1 - w) + sharp * w
     lum = out.mean(2)
     var = np.clip(p.nlf_a * lum + p.nlf_c, 0.2, 80)
@@ -212,6 +214,9 @@ def finish(out: np.ndarray, weight: np.ndarray, p: HostParams, rng) -> np.ndarra
     n = cv2.GaussianBlur(n, (0, 0), 0.6)          # demosaic / denoise leave correlated grain
     n /= n.std() + 1e-6
     chroma = cv2.GaussianBlur(rng.normal(0, 1, out.shape).astype(np.float32), (0, 0), 1.5) * 0.3
-    out = out + (n[..., None] + chroma) * np.sqrt(var)[..., None] * w
+    noise_strength = (0.65 + 0.35 * snow_detail) * (1 - 0.65 * extreme_smooth)
+    if thick_snow is not None:
+        noise_strength = noise_strength * (1 - 0.9 * np.clip(thick_snow, 0, 1))[..., None]
+    out = out + (n[..., None] + chroma) * np.sqrt(var)[..., None] * w * noise_strength
     hi = np.array(p.clip_hi, np.float32)
     return np.clip(out, 0, hi[None, None, :])

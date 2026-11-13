@@ -157,12 +157,13 @@ def make_material(lay, target, scenario, rng):
         mat[~surf] = G.BARE
         cov = lambda mm: np.isin(mm, G.COUNTED)[zone].mean()
 
+        rim_random = rng.random(mat.shape)  # fixed for every threshold evaluation
         def melt(t):
             mm = mat.copy()
             mlt = (depth < t) & np.isin(mm, (G.FRESH, G.PACKED))
             mm[mlt] = G.BARE
             rim = ndi.binary_dilation(mlt, iterations=G.m(0.3)) & np.isin(mm, (G.FRESH, G.PACKED))
-            mm[rim & (rng.random(mm.shape) < 0.5)] = G.SLUSH
+            mm[rim & (rim_random < 0.5)] = G.SLUSH
             return mm
         if cov(mat) < target:
             continue
@@ -353,7 +354,9 @@ def render(mat_bev, depth_bev, rng, ctx_cov):
     out_s += rng.normal(0, 1, out_s.shape) * sigma0 * np.sqrt(np.clip(bright, 0.3, 3)) * vis_all[..., None]
     ok, enc = cv2.imencode(".jpg", np.clip(out_s, 0, 255).astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, 88])
     final = cv2.imdecode(enc, cv2.IMREAD_COLOR)
-    label = vis_all > 0.5                     # every visible snow pixel (lot + context)
+    label = (vis_all >= 0.85).astype(np.uint8)
+    label[(vis_all > 0.01) & (vis_all < 0.85)] = 255
+    label[(a_sl > 0.01) & (vis_all < 0.85)] = 255  # slush/ice is ambiguous, not negative
     footprint = (alpha_g > 0.5) & surf        # ground footprint inside the lot -> coverage %
     return final, label, footprint
 
@@ -372,11 +375,16 @@ if __name__ == "__main__":
         mat_bev, depth_bev, cov = make_material(LAY, t, scn, rng)
         img, label, foot = render(mat_bev, depth_bev, rng, cc)
         cv2.imwrite(f"v2_render_{i}_{scn}.jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        cv2.imwrite(f"v2_label_{i}_{scn}.png", (label * 255).astype(np.uint8))
+        label_path = f"v2_label_{i}_{scn}.png"
+        if not cv2.imwrite(label_path, label):
+            raise IOError(f"Cannot save mask: {label_path}")
+        restored = cv2.imread(label_path, cv2.IMREAD_UNCHANGED)
+        if restored.dtype != np.uint8 or not np.array_equal(restored, label) or not set(np.unique(restored)) <= {0, 1, 255}:
+            raise IOError(f"Invalid binary mask round-trip: {label_path}")
         lab_cov = (area * foot)[inz].sum() / area[inz].sum()
         print(f"{scn:12s} target {t:.0%} | generator {cov:.1%} | footprint ground-area {lab_cov:.1%}")
         ov = img.copy()
-        ov[label] = (0.45 * ov[label] + 0.55 * np.array([255, 120, 0])).astype(np.uint8)
+        ov[label == 1] = (0.45 * ov[label == 1] + 0.55 * np.array([255, 120, 0])).astype(np.uint8)
         tiles.append((img, ov, scn, lab_cov))
     rows = []
     for img, ov, scn, c in tiles:
