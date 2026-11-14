@@ -43,6 +43,60 @@ class BatchTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 batch.main(args+['--resume','--min-confidence','.6'])
 
+    def test_resized_cropped_render_keeps_masks_aligned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);src=root/'photos';src.mkdir();out=root/'fast'
+            # Scaling the synthetic scene makes an HD-like source without
+            # depending on a network, a pretrained net or private photos.
+            large=cv2.resize(scene(),(1360,800),interpolation=cv2.INTER_NEAREST)
+            Image.fromarray(large).save(src/'one.jpg')
+            def fake_run(argv,**kwargs):
+                dest=Path(argv[argv.index('--output')+1]);dest.mkdir()
+                specfile=Path(argv[3])
+                payload=json.loads(specfile.read_text())
+                sample=payload['sample']
+                with Image.open(specfile.parent/sample['image_path']) as image:
+                    rgb=np.asarray(image.convert('RGB'))
+                with Image.open(specfile.parent/sample['roof_mask']) as mask:
+                    roof=np.asarray(mask)>0
+                self.assertEqual(roof.shape,rgb.shape[:2])
+                snow=np.full(roof.shape,255,np.uint8);snow[roof]=1
+                Image.fromarray(rgb).save(dest/'image.png')
+                Image.fromarray(snow).save(dest/'mask.png')
+                return subprocess.CompletedProcess(argv,0,'','')
+            cmd=['--input',str(src),'--output',str(out),'--render','--verified-clean',
+                 '--max-roofs','2','--variants','1','--min-confidence','.35',
+                 '--work-max-side','512','--roof-crop-pad','24',
+                 '--include-clean-controls','--no-ridges']
+            with patch.object(batch.subprocess,'run',side_effect=fake_run):
+                self.assertEqual(batch.main(cmd),0)
+            rows=batch.collect_rows(out/'samples')
+            self.assertGreaterEqual(len(rows),2)
+            for row in rows:
+                with Image.open(out/row['image']) as im:
+                    size=im.size
+                with Image.open(out/row['mask']) as im:
+                    self.assertEqual(im.size,size)
+                    self.assertTrue(set(np.unique(im))<={0,1,255})
+                with Image.open(out/row['roi']) as im:
+                    self.assertEqual(im.size,size)
+                self.assertEqual((int(row['original_width']),int(row['original_height'])),(1360,800))
+                self.assertLessEqual(int(row['work_width']),512)
+                self.assertLess(int(row['work_height']),512)
+            # Cropped masks remain valid in their own image coordinate system.
+            self.assertEqual(batch.main(cmd+['--resume']),0)
+            with self.assertRaises(SystemExit):
+                batch.main(cmd+['--resume','--roof-crop-pad','25'])
+
+    def test_processing_uses_original_when_max_side_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);src=root/'scene.png'
+            Image.fromarray(scene()).save(src)
+            image,path,size=batch.prepare_work_image(src,root/'working',0,90)
+            self.assertEqual(size,(340,200))
+            self.assertEqual(path,src)
+            self.assertEqual(image.shape,scene().shape)
+
     def test_refuse_to_render_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);src=root/'photos';src.mkdir()
